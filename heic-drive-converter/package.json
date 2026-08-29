@@ -1,0 +1,27 @@
+{
+  "name": "heic-drive-converter",
+  "version": "1.0.0",
+  "description": "Google Drive HEIC to JPG Local Conversion Service for VPS",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "scan": "node src/scanner.js",
+    "status": "node src/status.js",
+    "test": "node -e \"console.log('Package is runnable')\""
+  },
+  "keywords": [
+    "heic",
+    "jpg",
+    "google-drive",
+    "vps",
+    "automation"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "googleapis": "^122.0.0",
+    "image-size": "^1.1.1",
+    "sqlite3": "^5.1.7"
+  }
+}
