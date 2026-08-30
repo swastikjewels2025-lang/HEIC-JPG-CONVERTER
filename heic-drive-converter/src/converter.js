@@ -175,7 +175,9 @@ const pythonScriptPath = path.join(__dirname, 'convert_heic.py');
  * Normalizes HDR color gamuts, uses subsampling=0 (4:4:4), and guarantees zero green/red tile artifacts.
  */
 async function convertWithPythonPillow(inputPath, outputPath, quality) {
-  await runCommand('python3', [pythonScriptPath, inputPath, outputPath, String(quality || 95)]);
+  const venvPython = path.join(__dirname, '../venv/bin/python3');
+  const pythonCmd = fs.existsSync(venvPython) ? venvPython : 'python3';
+  await runCommand(pythonCmd, [pythonScriptPath, inputPath, outputPath, String(quality || 95)]);
 }
 
 /**
