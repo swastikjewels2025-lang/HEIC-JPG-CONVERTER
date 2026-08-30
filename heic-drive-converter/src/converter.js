@@ -2,33 +2,139 @@ const { execFile } = require('child_process');
 const config = require('./config');
 const logger = require('./logger');
 
+let sharp;
+try {
+  sharp = require('sharp');
+} catch (e) {
+  // sharp is optional if system binaries are used
+  sharp = null;
+}
+
 /**
- * Converts a HEIC file to JPG locally using the heif-convert command-line tool.
+ * Executes a CLI conversion command wrapped in a Promise.
+ */
+function runCommand(command, args) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, (error, stdout, stderr) => {
+      if (error) {
+        return reject({ error, stderr, code: error.code });
+      }
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+/**
+ * Converts HEIC to JPG using sharp (Node.js native binding).
+ */
+async function convertWithSharp(inputPath, outputPath, quality) {
+  if (!sharp) throw new Error('sharp module not loaded');
+  await sharp(inputPath)
+    .rotate() // Auto-orient based on EXIF
+    .jpeg({ quality: parseInt(quality, 10) || 92, mozjpeg: true })
+    .toFile(outputPath);
+}
+
+/**
+ * Converts HEIC to JPG using heif-convert CLI.
+ */
+async function convertWithHeifConvert(inputPath, outputPath, quality) {
+  await runCommand('heif-convert', ['-q', quality, inputPath, outputPath]);
+}
+
+/**
+ * Converts HEIC to JPG using ImageMagick (magick or convert).
+ */
+async function convertWithImageMagick(inputPath, outputPath, quality) {
+  try {
+    await runCommand('magick', [inputPath, '-quality', quality, outputPath]);
+  } catch (err) {
+    if (err.code === 'ENOENT') {
+      // Try older 'convert' binary
+      await runCommand('convert', [inputPath, '-quality', quality, outputPath]);
+    } else {
+      throw err;
+    }
+  }
+}
+
+/**
+ * Converts HEIC to JPG using FFmpeg.
+ */
+async function convertWithFfmpeg(inputPath, outputPath) {
+  await runCommand('ffmpeg', ['-y', '-i', inputPath, '-q:v', '2', outputPath]);
+}
+
+/**
+ * Converts a HEIC file to JPG using a multi-engine fallback strategy:
+ * 1. Sharp (Native libvips - supports Apple HDR / alpha channels / fast)
+ * 2. heif-convert (libheif-examples)
+ * 3. ImageMagick (magick / convert)
+ * 4. FFmpeg
  * 
  * @param {string} inputPath Absolute path to the source HEIC file
  * @param {string} outputPath Absolute path to the target JPG file
  * @returns {Promise<string>} Path to the generated JPG file
  */
-function convertHeicToJpg(inputPath, outputPath) {
-  return new Promise((resolve, reject) => {
-    const quality = String(config.jpegQuality);
-    logger.info(`Starting local HEIC conversion (Quality: ${quality}): ${inputPath} -> ${outputPath}`);
-    
-    // Spawn heif-convert process safely
-    execFile('heif-convert', ['-q', quality, inputPath, outputPath], (error, stdout, stderr) => {
-      if (error) {
-        if (error.code === 'ENOENT') {
-          return reject(new Error(`heif-convert utility was not found. Please ensure 'libheif-examples' is installed on your VPS (run: sudo apt-get install -y libheif-examples)`));
-        }
-        logger.error(`heif-convert execution error for ${inputPath}:`, error);
-        logger.error(`stderr output: ${stderr}`);
-        return reject(new Error(`heif-convert failed: ${stderr || error.message}`));
-      }
-      
-      logger.info(`Local HEIC conversion successful: ${outputPath}`);
-      resolve(outputPath);
-    });
-  });
+async function convertHeicToJpg(inputPath, outputPath) {
+  const quality = String(config.jpegQuality || 92);
+  logger.info(`Starting HEIC conversion (Quality: ${quality}): ${inputPath} -> ${outputPath}`);
+
+  const errors = [];
+
+  // Engine 1: Sharp
+  if (sharp) {
+    try {
+      logger.info('Attempting conversion via Sharp...');
+      await convertWithSharp(inputPath, outputPath, quality);
+      logger.info(`Conversion successful via Sharp: ${outputPath}`);
+      return outputPath;
+    } catch (err) {
+      logger.warn(`Sharp conversion attempt failed: ${err.message}. Trying next engine...`);
+      errors.push(`Sharp: ${err.message}`);
+    }
+  }
+
+  // Engine 2: heif-convert
+  try {
+    logger.info('Attempting conversion via heif-convert...');
+    await convertWithHeifConvert(inputPath, outputPath, quality);
+    logger.info(`Conversion successful via heif-convert: ${outputPath}`);
+    return outputPath;
+  } catch (err) {
+    const msg = err.stderr || (err.error && err.error.message) || err;
+    logger.warn(`heif-convert attempt failed: ${msg}. Trying next engine...`);
+    errors.push(`heif-convert: ${msg}`);
+  }
+
+  // Engine 3: ImageMagick
+  try {
+    logger.info('Attempting conversion via ImageMagick...');
+    await convertWithImageMagick(inputPath, outputPath, quality);
+    logger.info(`Conversion successful via ImageMagick: ${outputPath}`);
+    return outputPath;
+  } catch (err) {
+    const msg = err.stderr || (err.error && err.error.message) || err;
+    logger.warn(`ImageMagick attempt failed: ${msg}. Trying next engine...`);
+    errors.push(`ImageMagick: ${msg}`);
+  }
+
+  // Engine 4: FFmpeg
+  try {
+    logger.info('Attempting conversion via FFmpeg...');
+    await convertWithFfmpeg(inputPath, outputPath);
+    logger.info(`Conversion successful via FFmpeg: ${outputPath}`);
+    return outputPath;
+  } catch (err) {
+    const msg = err.stderr || (err.error && err.error.message) || err;
+    logger.warn(`FFmpeg attempt failed: ${msg}.`);
+    errors.push(`FFmpeg: ${msg}`);
+  }
+
+  // If all failed
+  const aggregatedErrors = errors.join(' | ');
+  logger.error(`All conversion engines failed for ${inputPath}: ${aggregatedErrors}`);
+  throw new Error(`HEIC conversion failed across all engines. Details: ${aggregatedErrors}`);
 }
 
 module.exports = {

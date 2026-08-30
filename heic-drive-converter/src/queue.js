@@ -36,9 +36,9 @@ async function addToQueue(fileId, filename, ext, mimeType, targetFilename) {
 }
 
 /**
- * Gets the next pending job from the database, respecting the retry backoff.
+ * Atomically claims the next pending job from the database, preventing race conditions.
  */
-async function getNextPendingJob() {
+async function claimNextPendingJob() {
   const now = Date.now();
   const sql = `
     SELECT * FROM conversion_queue 
@@ -46,7 +46,23 @@ async function getNextPendingJob() {
     ORDER BY created_at ASC 
     LIMIT 1
   `;
-  return await db.get(sql, [now]);
+  const job = await db.get(sql, [now]);
+  if (!job) return null;
+
+  // Atomically update status to PROCESSING
+  const result = await db.run(`
+    UPDATE conversion_queue 
+    SET status = 'PROCESSING', started_at = ?, updated_at = ?
+    WHERE file_id = ? AND status = ?
+  `, [now, now, job.file_id, job.status]);
+
+  if (result.changes === 0) {
+    // Another concurrent worker claimed this job first
+    return null;
+  }
+
+  job.status = 'PROCESSING';
+  return job;
 }
 
 /**
@@ -157,7 +173,6 @@ async function processJob(job) {
   const tempJpgPath = path.join(config.tempDir, `${job.file_id}.jpg`);
 
   try {
-    await updateJobStatus(job.file_id, 'PROCESSING');
     logger.info(`Processing Job: ${job.filename} (${job.file_id})`);
 
     // 1. Download file
@@ -220,7 +235,7 @@ async function processQueue() {
   }
 
   try {
-    const job = await getNextPendingJob();
+    const job = await claimNextPendingJob();
     if (!job) {
       return; // No pending or retry-ready jobs
     }
