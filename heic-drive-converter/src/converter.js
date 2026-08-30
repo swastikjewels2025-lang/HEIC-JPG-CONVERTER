@@ -1,3 +1,4 @@
+const fs = require('fs');
 const { execFile } = require('child_process');
 const config = require('./config');
 const logger = require('./logger');
@@ -6,8 +7,14 @@ let sharp;
 try {
   sharp = require('sharp');
 } catch (e) {
-  // sharp is optional if system binaries are used
   sharp = null;
+}
+
+let heicConvert;
+try {
+  heicConvert = require('heic-convert');
+} catch (e) {
+  heicConvert = null;
 }
 
 /**
@@ -33,6 +40,21 @@ async function convertWithSharp(inputPath, outputPath, quality) {
     .rotate() // Auto-orient based on EXIF
     .jpeg({ quality: parseInt(quality, 10) || 92, mozjpeg: true })
     .toFile(outputPath);
+}
+
+/**
+ * Converts HEIC to JPG using pure JS/WASM heic-convert npm library.
+ */
+async function convertWithHeicConvertNpm(inputPath, outputPath, quality) {
+  if (!heicConvert) throw new Error('heic-convert npm module not loaded');
+  const inputBuffer = await fs.promises.readFile(inputPath);
+  const qFloat = Math.min(Math.max((parseInt(quality, 10) || 92) / 100, 0.1), 1.0);
+  const outputBuffer = await heicConvert({
+    buffer: inputBuffer,
+    format: 'JPEG',
+    quality: qFloat
+  });
+  await fs.promises.writeFile(outputPath, outputBuffer);
 }
 
 /**
@@ -95,16 +117,29 @@ async function convertHeicToJpg(inputPath, outputPath) {
     }
   }
 
-  // Engine 2: heif-convert
+  // Engine 2: Pure Node.js WASM / libde265 (heic-convert npm)
+  if (heicConvert) {
+    try {
+      logger.info('Attempting conversion via heic-convert (Node.js WASM / libde265)...');
+      await convertWithHeicConvertNpm(inputPath, outputPath, quality);
+      logger.info(`Conversion successful via heic-convert npm: ${outputPath}`);
+      return outputPath;
+    } catch (err) {
+      logger.warn(`heic-convert npm attempt failed: ${err.message}. Trying next engine...`);
+      errors.push(`heic-convert-npm: ${err.message}`);
+    }
+  }
+
+  // Engine 3: heif-convert (CLI)
   try {
-    logger.info('Attempting conversion via heif-convert...');
+    logger.info('Attempting conversion via heif-convert CLI...');
     await convertWithHeifConvert(inputPath, outputPath, quality);
-    logger.info(`Conversion successful via heif-convert: ${outputPath}`);
+    logger.info(`Conversion successful via heif-convert CLI: ${outputPath}`);
     return outputPath;
   } catch (err) {
     const msg = err.stderr || (err.error && err.error.message) || err;
-    logger.warn(`heif-convert attempt failed: ${msg}. Trying next engine...`);
-    errors.push(`heif-convert: ${msg}`);
+    logger.warn(`heif-convert CLI attempt failed: ${msg}. Trying next engine...`);
+    errors.push(`heif-convert-cli: ${msg}`);
   }
 
   // Engine 3: ImageMagick
