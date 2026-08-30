@@ -3,16 +3,32 @@ const { google } = require('googleapis');
 const config = require('./config');
 const logger = require('./logger');
 
-// Initialize Auth Client
+// Initialize Auth Client (Supports both Service Account JSON and OAuth2 Credentials)
 let auth;
 try {
-  if (!fs.existsSync(config.credentialsPath)) {
-    logger.warn(`Credentials file not found at ${config.credentialsPath}. The service will fail to authenticate unless environment-default credentials exist.`);
+  if (process.env.GOOGLE_CLIENT_ID && process.env.GOOGLE_CLIENT_SECRET && process.env.GOOGLE_REFRESH_TOKEN) {
+    // OAuth2 User Authentication
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CLIENT_ID,
+      process.env.GOOGLE_CLIENT_SECRET,
+      'https://developers.google.com/oauthplayground'
+    );
+    oauth2Client.setCredentials({
+      refresh_token: process.env.GOOGLE_REFRESH_TOKEN
+    });
+    auth = oauth2Client;
+    logger.info('Using Google OAuth2 User Credentials for Drive API.');
+  } else {
+    // Service Account Key Authentication
+    if (!fs.existsSync(config.credentialsPath)) {
+      logger.warn(`Credentials file not found at ${config.credentialsPath}. The service will fail to authenticate unless environment-default credentials exist.`);
+    }
+    auth = new google.auth.GoogleAuth({
+      keyFile: config.credentialsPath,
+      scopes: ['https://www.googleapis.com/auth/drive']
+    });
+    logger.info('Using Google Service Account for Drive API.');
   }
-  auth = new google.auth.GoogleAuth({
-    keyFile: config.credentialsPath,
-    scopes: ['https://www.googleapis.com/auth/drive']
-  });
 } catch (err) {
   logger.error('Failed to initialize Google Auth Client: ', err);
   process.exit(1);
@@ -34,7 +50,10 @@ async function listFolderFiles() {
       q: `'${config.driveFolderId}' in parents and trashed = false`,
       fields: 'nextPageToken, files(id, name, size, mimeType, createdTime)',
       pageSize: 1000,
-      pageToken: pageToken
+      pageToken: pageToken,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      corpora: 'allDrives'
     });
     if (res.data.files) {
       filesList = filesList.concat(res.data.files);
@@ -54,7 +73,7 @@ async function listFolderFiles() {
 async function downloadFile(fileId, localPath) {
   const dest = fs.createWriteStream(localPath);
   const res = await drive.files.get(
-    { fileId, alt: 'media' },
+    { fileId, alt: 'media', supportsAllDrives: true },
     { responseType: 'stream' }
   );
 
@@ -101,7 +120,8 @@ async function uploadFile(filename, localPath) {
   const res = await drive.files.create({
     requestBody: fileMetadata,
     media: media,
-    fields: 'id, name, size'
+    fields: 'id, name, size',
+    supportsAllDrives: true
   });
   return res.data;
 }
@@ -115,7 +135,8 @@ async function uploadFile(filename, localPath) {
 async function trashFile(fileId) {
   await drive.files.update({
     fileId: fileId,
-    requestBody: { trashed: true }
+    requestBody: { trashed: true },
+    supportsAllDrives: true
   });
 }
 
@@ -129,7 +150,8 @@ async function checkFileExists(fileId) {
   try {
     const res = await drive.files.get({
       fileId,
-      fields: 'id, name, size, trashed'
+      fields: 'id, name, size, trashed',
+      supportsAllDrives: true
     });
     return res.data && !res.data.trashed;
   } catch (err) {
