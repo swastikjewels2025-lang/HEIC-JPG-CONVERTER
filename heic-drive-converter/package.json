@@ -25,6 +25,7 @@
     "heic-convert": "^2.1.0",
     "heic-decode": "^2.1.0",
     "image-size": "^1.1.1",
+    "libheif-js": "^1.17.1",
     "sharp": "^0.33.5",
     "sqlite3": "^5.1.7"
   }

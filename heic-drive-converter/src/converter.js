@@ -17,6 +17,13 @@ try {
   sharp = null;
 }
 
+let libheif;
+try {
+  libheif = require('libheif-js');
+} catch (e) {
+  libheif = null;
+}
+
 let heicDecode;
 try {
   heicDecode = require('heic-decode');
@@ -46,19 +53,48 @@ function runCommand(command, args) {
 }
 
 /**
- * High-Fidelity Conversion: Decodes raw HEIC via WASM and encodes via Sharp
- * with 4:4:4 Chroma Subsampling & sRGB normalization.
- * Eliminates color tinting, green/red casts on dark backgrounds, and preserves 100% sharpness.
+ * Official libheif-js WASM Decoder + Sharp MozJPEG Encoder
+ * Selects highest-resolution primary image (never dark depth map),
+ * normalizes to sRGB, and uses 4:4:4 chroma subsampling for zero color artifacts.
  */
-async function convertWithHeicDecodeSharp(inputPath, outputPath, quality) {
-  if (!heicDecode) throw new Error('heic-decode module not loaded');
+async function convertWithLibheifJsSharp(inputPath, outputPath, quality) {
+  if (!libheif) throw new Error('libheif-js module not loaded');
   if (!sharp) throw new Error('sharp module not loaded');
-  
+
   const inputBuffer = await fs.promises.readFile(inputPath);
-  const { data, width, height } = await heicDecode({ buffer: inputBuffer });
-  
+  const decoder = new libheif.HeifDecoder();
+  const data = decoder.decode(inputBuffer);
+  if (!data || !data.length) {
+    throw new Error('No images found in HEIF file');
+  }
+
+  // Find the primary high-resolution image (skips thumbnails & depth maps)
+  let primaryImage = data[0];
+  for (const img of data) {
+    if (img.get_width() > primaryImage.get_width()) {
+      primaryImage = img;
+    }
+  }
+
+  const width = primaryImage.get_width();
+  const height = primaryImage.get_height();
+  const displayData = {
+    data: new Uint8ClampedArray(width * height * 4),
+    width: width,
+    height: height
+  };
+
+  const rawData = await new Promise((resolve, reject) => {
+    primaryImage.display(displayData, (result) => {
+      if (!result || !result.data) {
+        return reject(new Error('Failed to decode HEIF display frame'));
+      }
+      resolve(result.data);
+    });
+  });
+
   const q = Math.max(parseInt(quality, 10) || 95, 92);
-  await sharp(Buffer.from(data), {
+  await sharp(Buffer.from(rawData.buffer, rawData.byteOffset, rawData.byteLength), {
     raw: {
       width,
       height,
@@ -133,8 +169,8 @@ async function convertWithFfmpeg(inputPath, outputPath, quality) {
 
 /**
  * Converts a HEIC file to JPG using a multi-engine fallback strategy:
- * 1. FFmpeg (Full Apple HEVC tile support, zero color blocks / green patches)
- * 2. High-Fidelity HEIC Decode + Sharp 4:4:4
+ * 1. Official libheif-js WASM Decoder + Sharp 4:4:4 Encoder (Primary high-res frame, accurate color, no tile artifacts, no blank depth maps)
+ * 2. FFmpeg (Static or system binary)
  * 3. Sharp Direct
  * 4. heic-convert npm
  * 5. heif-convert CLI
@@ -145,14 +181,27 @@ async function convertWithFfmpeg(inputPath, outputPath, quality) {
  * @returns {Promise<string>} Path to the generated JPG file
  */
 async function convertHeicToJpg(inputPath, outputPath) {
-  const quality = String(config.jpegQuality || 92);
+  const quality = String(config.jpegQuality || 95);
   logger.info(`Starting HEIC conversion (Quality: ${quality}): ${inputPath} -> ${outputPath}`);
 
   const errors = [];
 
-  // Engine 1: FFmpeg (Static or System) - Handles Apple iPhone HEVC multi-tile slices without green/red block artifacts
+  // Engine 1: Official libheif-js WASM + Sharp MozJPEG 4:4:4
+  if (libheif && sharp) {
+    try {
+      logger.info('Attempting conversion via libheif-js + Sharp (High-Res Primary Frame, 4:4:4)...');
+      await convertWithLibheifJsSharp(inputPath, outputPath, quality);
+      logger.info(`Conversion successful via libheif-js + Sharp: ${outputPath}`);
+      return outputPath;
+    } catch (err) {
+      logger.warn(`libheif-js + Sharp attempt failed: ${err.message}. Trying next engine...`);
+      errors.push(`libheif-js: ${err.message}`);
+    }
+  }
+
+  // Engine 2: FFmpeg (Static or System)
   try {
-    logger.info('Attempting conversion via FFmpeg (Artifact-Free)...');
+    logger.info('Attempting conversion via FFmpeg...');
     await convertWithFfmpeg(inputPath, outputPath, quality);
     logger.info(`Conversion successful via FFmpeg: ${outputPath}`);
     return outputPath;
