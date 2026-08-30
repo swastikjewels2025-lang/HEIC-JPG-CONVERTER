@@ -3,6 +3,13 @@ const { execFile } = require('child_process');
 const config = require('./config');
 const logger = require('./logger');
 
+let ffmpegPath;
+try {
+  ffmpegPath = require('ffmpeg-static');
+} catch (e) {
+  ffmpegPath = null;
+}
+
 let sharp;
 try {
   sharp = require('sharp');
@@ -117,18 +124,21 @@ async function convertWithImageMagick(inputPath, outputPath, quality) {
 }
 
 /**
- * Converts HEIC to JPG using FFmpeg.
+ * Converts HEIC to JPG using FFmpeg (Highest color accuracy, zero green/red tile artifacts).
  */
-async function convertWithFfmpeg(inputPath, outputPath) {
-  await runCommand('ffmpeg', ['-y', '-i', inputPath, '-q:v', '2', outputPath]);
+async function convertWithFfmpeg(inputPath, outputPath, quality) {
+  const binary = ffmpegPath || 'ffmpeg';
+  await runCommand(binary, ['-y', '-i', inputPath, '-frames:v', '1', '-q:v', '2', outputPath]);
 }
 
 /**
  * Converts a HEIC file to JPG using a multi-engine fallback strategy:
- * 1. Sharp (Native libvips - supports Apple HDR / alpha channels / fast)
- * 2. heif-convert (libheif-examples)
- * 3. ImageMagick (magick / convert)
- * 4. FFmpeg
+ * 1. FFmpeg (Full Apple HEVC tile support, zero color blocks / green patches)
+ * 2. High-Fidelity HEIC Decode + Sharp 4:4:4
+ * 3. Sharp Direct
+ * 4. heic-convert npm
+ * 5. heif-convert CLI
+ * 6. ImageMagick
  * 
  * @param {string} inputPath Absolute path to the source HEIC file
  * @param {string} outputPath Absolute path to the target JPG file
@@ -140,7 +150,19 @@ async function convertHeicToJpg(inputPath, outputPath) {
 
   const errors = [];
 
-  // Engine 1: Pure WASM Raw HEIC Decode + Sharp 4:4:4 High-Fidelity sRGB Encoder
+  // Engine 1: FFmpeg (Static or System) - Handles Apple iPhone HEVC multi-tile slices without green/red block artifacts
+  try {
+    logger.info('Attempting conversion via FFmpeg (Artifact-Free)...');
+    await convertWithFfmpeg(inputPath, outputPath, quality);
+    logger.info(`Conversion successful via FFmpeg: ${outputPath}`);
+    return outputPath;
+  } catch (err) {
+    const msg = err.stderr || (err.error && err.error.message) || err.message || err;
+    logger.warn(`FFmpeg attempt failed: ${msg}. Trying next engine...`);
+    errors.push(`FFmpeg: ${msg}`);
+  }
+
+  // Engine 2: Pure WASM Raw HEIC Decode + Sharp 4:4:4 High-Fidelity sRGB Encoder
   if (heicDecode && sharp) {
     try {
       logger.info('Attempting conversion via high-fidelity HEIC Decode + Sharp 4:4:4...');
@@ -153,7 +175,7 @@ async function convertHeicToJpg(inputPath, outputPath) {
     }
   }
 
-  // Engine 2: Sharp Direct
+  // Engine 3: Sharp Direct
   if (sharp) {
     try {
       logger.info('Attempting conversion via Sharp...');
@@ -166,7 +188,7 @@ async function convertHeicToJpg(inputPath, outputPath) {
     }
   }
 
-  // Engine 3: heic-convert fallback
+  // Engine 4: heic-convert fallback
   if (heicConvert) {
     try {
       logger.info('Attempting conversion via heic-convert npm...');
@@ -179,7 +201,7 @@ async function convertHeicToJpg(inputPath, outputPath) {
     }
   }
 
-  // Engine 3: heif-convert (CLI)
+  // Engine 5: heif-convert (CLI)
   try {
     logger.info('Attempting conversion via heif-convert CLI...');
     await convertWithHeifConvert(inputPath, outputPath, quality);
@@ -191,7 +213,7 @@ async function convertHeicToJpg(inputPath, outputPath) {
     errors.push(`heif-convert-cli: ${msg}`);
   }
 
-  // Engine 3: ImageMagick
+  // Engine 6: ImageMagick
   try {
     logger.info('Attempting conversion via ImageMagick...');
     await convertWithImageMagick(inputPath, outputPath, quality);
@@ -199,20 +221,8 @@ async function convertHeicToJpg(inputPath, outputPath) {
     return outputPath;
   } catch (err) {
     const msg = err.stderr || (err.error && err.error.message) || err;
-    logger.warn(`ImageMagick attempt failed: ${msg}. Trying next engine...`);
+    logger.warn(`ImageMagick attempt failed: ${msg}.`);
     errors.push(`ImageMagick: ${msg}`);
-  }
-
-  // Engine 4: FFmpeg
-  try {
-    logger.info('Attempting conversion via FFmpeg...');
-    await convertWithFfmpeg(inputPath, outputPath);
-    logger.info(`Conversion successful via FFmpeg: ${outputPath}`);
-    return outputPath;
-  } catch (err) {
-    const msg = err.stderr || (err.error && err.error.message) || err;
-    logger.warn(`FFmpeg attempt failed: ${msg}.`);
-    errors.push(`FFmpeg: ${msg}`);
   }
 
   // If all failed
