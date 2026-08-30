@@ -167,14 +167,26 @@ async function convertWithFfmpeg(inputPath, outputPath, quality) {
   await runCommand(binary, ['-y', '-i', inputPath, '-frames:v', '1', '-q:v', '2', outputPath]);
 }
 
+const path = require('path');
+const pythonScriptPath = path.join(__dirname, 'convert_heic.py');
+
+/**
+ * Converts HEIC to JPG using Python pillow-heif (Industry gold standard for 10-bit HDR Apple HEIC).
+ * Normalizes HDR color gamuts, uses subsampling=0 (4:4:4), and guarantees zero green/red tile artifacts.
+ */
+async function convertWithPythonPillow(inputPath, outputPath, quality) {
+  await runCommand('python3', [pythonScriptPath, inputPath, outputPath, String(quality || 95)]);
+}
+
 /**
  * Converts a HEIC file to JPG using a multi-engine fallback strategy:
- * 1. Official libheif-js WASM Decoder + Sharp 4:4:4 Encoder (Primary high-res frame, accurate color, no tile artifacts, no blank depth maps)
- * 2. FFmpeg (Static or system binary)
- * 3. Sharp Direct
- * 4. heic-convert npm
- * 5. heif-convert CLI
- * 6. ImageMagick
+ * 1. Python pillow-heif (Artifact-Free HDR & Tile Decoding)
+ * 2. Official libheif-js WASM Decoder + Sharp 4:4:4 Encoder
+ * 3. FFmpeg (Static or system binary)
+ * 4. Sharp Direct
+ * 5. heic-convert npm
+ * 6. heif-convert CLI
+ * 7. ImageMagick
  * 
  * @param {string} inputPath Absolute path to the source HEIC file
  * @param {string} outputPath Absolute path to the target JPG file
@@ -186,7 +198,19 @@ async function convertHeicToJpg(inputPath, outputPath) {
 
   const errors = [];
 
-  // Engine 1: Official libheif-js WASM + Sharp MozJPEG 4:4:4
+  // Engine 1: Python pillow-heif (Best accuracy for 10-bit Apple HEIC & dark backgrounds)
+  try {
+    logger.info('Attempting conversion via Python pillow-heif (HDR 4:4:4)...');
+    await convertWithPythonPillow(inputPath, outputPath, quality);
+    logger.info(`Conversion successful via Python pillow-heif: ${outputPath}`);
+    return outputPath;
+  } catch (err) {
+    const msg = err.stderr || (err.error && err.error.message) || err.message || err;
+    logger.warn(`Python pillow-heif attempt skipped/failed: ${msg}. Trying next engine...`);
+    errors.push(`python-heif: ${msg}`);
+  }
+
+  // Engine 2: Official libheif-js WASM + Sharp MozJPEG 4:4:4
   if (libheif && sharp) {
     try {
       logger.info('Attempting conversion via libheif-js + Sharp (High-Res Primary Frame, 4:4:4)...');
