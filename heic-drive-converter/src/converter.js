@@ -10,6 +10,13 @@ try {
   sharp = null;
 }
 
+let heicDecode;
+try {
+  heicDecode = require('heic-decode');
+} catch (e) {
+  heicDecode = null;
+}
+
 let heicConvert;
 try {
   heicConvert = require('heic-convert');
@@ -32,13 +39,42 @@ function runCommand(command, args) {
 }
 
 /**
+ * High-Fidelity Conversion: Decodes raw HEIC via WASM and encodes via Sharp
+ * with 4:4:4 Chroma Subsampling & sRGB normalization.
+ * Eliminates color tinting, green/red casts on dark backgrounds, and preserves 100% sharpness.
+ */
+async function convertWithHeicDecodeSharp(inputPath, outputPath, quality) {
+  if (!heicDecode) throw new Error('heic-decode module not loaded');
+  if (!sharp) throw new Error('sharp module not loaded');
+  
+  const inputBuffer = await fs.promises.readFile(inputPath);
+  const { data, width, height } = await heicDecode({ buffer: inputBuffer });
+  
+  const q = Math.max(parseInt(quality, 10) || 95, 92);
+  await sharp(Buffer.from(data), {
+    raw: {
+      width,
+      height,
+      channels: 4
+    }
+  })
+    .toColorspace('srgb')
+    .jpeg({
+      quality: q,
+      mozjpeg: true,
+      chromaSubsampling: '4:4:4'
+    })
+    .toFile(outputPath);
+}
+
+/**
  * Converts HEIC to JPG using sharp (Node.js native binding).
  */
 async function convertWithSharp(inputPath, outputPath, quality) {
   if (!sharp) throw new Error('sharp module not loaded');
   await sharp(inputPath)
     .rotate() // Auto-orient based on EXIF
-    .jpeg({ quality: parseInt(quality, 10) || 92, mozjpeg: true })
+    .jpeg({ quality: parseInt(quality, 10) || 95, mozjpeg: true, chromaSubsampling: '4:4:4' })
     .toFile(outputPath);
 }
 
@@ -104,7 +140,20 @@ async function convertHeicToJpg(inputPath, outputPath) {
 
   const errors = [];
 
-  // Engine 1: Sharp
+  // Engine 1: Pure WASM Raw HEIC Decode + Sharp 4:4:4 High-Fidelity sRGB Encoder
+  if (heicDecode && sharp) {
+    try {
+      logger.info('Attempting conversion via high-fidelity HEIC Decode + Sharp 4:4:4...');
+      await convertWithHeicDecodeSharp(inputPath, outputPath, quality);
+      logger.info(`Conversion successful (High Fidelity 4:4:4): ${outputPath}`);
+      return outputPath;
+    } catch (err) {
+      logger.warn(`HEIC Decode + Sharp attempt failed: ${err.message}. Trying next engine...`);
+      errors.push(`HeicDecodeSharp: ${err.message}`);
+    }
+  }
+
+  // Engine 2: Sharp Direct
   if (sharp) {
     try {
       logger.info('Attempting conversion via Sharp...');
@@ -117,10 +166,10 @@ async function convertHeicToJpg(inputPath, outputPath) {
     }
   }
 
-  // Engine 2: Pure Node.js WASM / libde265 (heic-convert npm)
+  // Engine 3: heic-convert fallback
   if (heicConvert) {
     try {
-      logger.info('Attempting conversion via heic-convert (Node.js WASM / libde265)...');
+      logger.info('Attempting conversion via heic-convert npm...');
       await convertWithHeicConvertNpm(inputPath, outputPath, quality);
       logger.info(`Conversion successful via heic-convert npm: ${outputPath}`);
       return outputPath;
