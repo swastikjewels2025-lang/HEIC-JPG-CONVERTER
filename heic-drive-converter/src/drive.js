@@ -162,11 +162,50 @@ async function checkFileExists(fileId) {
   }
 }
 
+/**
+ * Checks if a specific filename already exists in the monitored folder.
+ */
+async function checkFilenameExistsInFolder(filename) {
+  try {
+    const res = await drive.files.list({
+      q: `'${config.driveFolderId}' in parents and name = '${filename}' and trashed = false`,
+      fields: 'files(id, name)',
+      pageSize: 1,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      corpora: 'allDrives'
+    });
+    return res.data.files && res.data.files.length > 0;
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * Returns a unique filename for the target Drive folder (e.g. DGR10278.jpg, DGR10278_1.jpg).
+ */
+async function getUniqueFilenameInFolder(baseName, ext = '.jpg') {
+  let target = `${baseName}${ext}`;
+  let exists = await checkFilenameExistsInFolder(target);
+  if (!exists) return target;
+
+  let counter = 1;
+  while (exists) {
+    target = `${baseName}_${counter}${ext}`;
+    exists = await checkFilenameExistsInFolder(target);
+    counter++;
+    if (counter > 50) break;
+  }
+  return target;
+}
+
 module.exports = {
   listFolderFiles,
   downloadFile,
   uploadFile,
   trashFile,
   checkFileExists,
+  checkFilenameExistsInFolder,
+  getUniqueFilenameInFolder,
   driveClient: drive
 };

@@ -6,6 +6,7 @@ const logger = require('./logger');
 const drive = require('./drive');
 const converter = require('./converter');
 const validator = require('./validator');
+const ocr = require('./ocr');
 
 // Create temp directory if it doesn't exist
 if (!fs.existsSync(config.tempDir)) {
@@ -190,18 +191,33 @@ async function processJob(job) {
       throw new Error('Local JPG validation checks failed. Image may be corrupted.');
     }
 
-    // 4. Upload file
-    logger.info(`Uploading JPG to Google Drive...`);
-    const uploadedFile = await drive.uploadFile(job.target_filename, tempJpgPath);
+    // 4. Analyze image via Local OCR for Tag Number (DGR10278, DPS3637, DLR2728, etc.)
+    let uploadFilename = job.target_filename;
+    try {
+      logger.info(`Scanning image for jewelry tag number via local OCR...`);
+      const detectedTag = await ocr.detectTagFromImage(tempJpgPath);
+      if (detectedTag) {
+        uploadFilename = await drive.getUniqueFilenameInFolder(detectedTag, '.jpg');
+        logger.info(`Auto-Renamed: Tag '${detectedTag}' detected! Target upload filename: '${uploadFilename}'`);
+      } else {
+        logger.info(`No specific tag detected in image. Using default filename: '${uploadFilename}'`);
+      }
+    } catch (ocrErr) {
+      logger.warn(`OCR tag scan skipped: ${ocrErr.message}. Using default name: '${uploadFilename}'`);
+    }
+
+    // 5. Upload file
+    logger.info(`Uploading JPG to Google Drive as '${uploadFilename}'...`);
+    const uploadedFile = await drive.uploadFile(uploadFilename, tempJpgPath);
     
-    // 5. Verify upload
-    logger.info(`Verifying uploaded file exists on Drive: ID ${uploadedFile.id}`);
+    // 6. Verify upload
+    logger.info(`Verifying uploaded file exists on Drive: ID ${uploadedFile.id} ('${uploadFilename}')`);
     const exists = await drive.checkFileExists(uploadedFile.id);
     if (!exists) {
       throw new Error(`Google Drive verification failed: Uploaded file ID ${uploadedFile.id} not found.`);
     }
 
-    // 6. Safe delete original
+    // 7. Safe delete original
     if (config.testMode) {
       logger.info(`[TEST MODE] Skipping trashing of original file: ${job.filename}`);
     } else {
@@ -209,9 +225,9 @@ async function processJob(job) {
       await drive.trashFile(job.file_id);
     }
 
-    // 7. Complete job
+    // 8. Complete job
     await updateJobStatus(job.file_id, 'COMPLETED');
-    logger.info(`Successfully completed job for ${job.filename}`);
+    logger.info(`Successfully completed job for ${job.filename} -> ${uploadFilename}`);
 
   } catch (err) {
     logger.error(`Error processing job for ${job.filename}: `, err);

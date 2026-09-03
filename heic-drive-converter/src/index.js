@@ -3,6 +3,7 @@ const config = require('./config');
 const logger = require('./logger');
 const drive = require('./drive');
 const queue = require('./queue');
+const ocr = require('./ocr');
 
 function getFileExtension(filename) {
   const parts = filename.split('.');
@@ -121,6 +122,9 @@ async function startDaemon() {
 
   // Initialize DB
   await db.init();
+
+  // Pre-warm OCR worker in background
+  ocr.prewarmWorker();
 
   // Run startup cleanups
   queue.cleanupOrphanedTempFiles();

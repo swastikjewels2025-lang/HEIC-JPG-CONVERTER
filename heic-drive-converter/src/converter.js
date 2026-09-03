@@ -176,7 +176,12 @@ const pythonScriptPath = path.join(__dirname, 'convert_heic.py');
  */
 async function convertWithPythonPillow(inputPath, outputPath, quality) {
   const venvPython = path.join(__dirname, '../venv/bin/python3');
-  const pythonCmd = fs.existsSync(venvPython) ? venvPython : 'python3';
+  let pythonCmd = 'python3';
+  if (fs.existsSync(venvPython)) {
+    pythonCmd = venvPython;
+  } else if (process.platform === 'win32') {
+    pythonCmd = 'python';
+  }
   await runCommand(pythonCmd, [pythonScriptPath, inputPath, outputPath, String(quality || 95)]);
 }
 

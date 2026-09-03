@@ -7,6 +7,7 @@
     "start": "node src/index.js",
     "scan": "node src/scanner.js",
     "status": "node src/status.js",
+    "reset": "node -e \"const fs=require('fs'); try{fs.unlinkSync('./data/queue.sqlite'); console.log('Queue reset successfully');}catch(e){console.log('Queue already clean.');}\"",
     "test": "node -e \"console.log('Package is runnable')\""
   },
   "keywords": [
@@ -27,6 +28,7 @@
     "image-size": "^1.1.1",
     "libheif-js": "^1.17.1",
     "sharp": "^0.33.5",
-    "sqlite3": "^5.1.7"
+    "sqlite3": "^5.1.7",
+    "tesseract.js": "^5.1.1"
   }
 }
