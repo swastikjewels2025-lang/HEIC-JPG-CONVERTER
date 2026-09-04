@@ -7,6 +7,7 @@
     "start": "node src/index.js",
     "scan": "node src/scanner.js",
     "status": "node src/status.js",
+    "test:speed": "node test_ocr.js",
     "reset": "node -e \"const fs=require('fs'); try{fs.unlinkSync('./data/queue.sqlite'); console.log('Queue reset successfully');}catch(e){console.log('Queue already clean.');}\"",
     "test": "node -e \"console.log('Package is runnable')\""
   },

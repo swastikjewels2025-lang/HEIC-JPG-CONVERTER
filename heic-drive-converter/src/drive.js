@@ -36,9 +36,11 @@ try {
 
 const drive = google.drive({ version: 'v3', auth });
 
+const folderFilenameCache = new Set();
+
 /**
  * Lists all non-folder, non-trashed files in the configured Drive folder.
- * Handles pagination automatically.
+ * Handles pagination automatically and updates the in-memory filename cache.
  * 
  * @returns {Promise<Array>} List of Google Drive file resource objects
  */
@@ -60,6 +62,15 @@ async function listFolderFiles() {
     }
     pageToken = res.data.nextPageToken;
   } while (pageToken);
+
+  // Refresh in-memory filename cache
+  folderFilenameCache.clear();
+  for (const file of filesList) {
+    if (file.name) {
+      folderFilenameCache.add(file.name.toLowerCase());
+    }
+  }
+
   return filesList;
 }
 
@@ -123,6 +134,10 @@ async function uploadFile(filename, localPath) {
     fields: 'id, name, size',
     supportsAllDrives: true
   });
+
+  // Add uploaded file to local filename cache
+  folderFilenameCache.add(filename.toLowerCase());
+
   return res.data;
 }
 
@@ -164,8 +179,14 @@ async function checkFileExists(fileId) {
 
 /**
  * Checks if a specific filename already exists in the monitored folder.
+ * Uses the in-memory cache for 0ms lookup, falling back to API if cache is uninitialized.
  */
 async function checkFilenameExistsInFolder(filename) {
+  const lower = filename.toLowerCase();
+  if (folderFilenameCache.size > 0) {
+    return folderFilenameCache.has(lower);
+  }
+
   try {
     const res = await drive.files.list({
       q: `'${config.driveFolderId}' in parents and name = '${filename}' and trashed = false`,
@@ -183,19 +204,25 @@ async function checkFilenameExistsInFolder(filename) {
 
 /**
  * Returns a unique filename for the target Drive folder (e.g. DGR10278.jpg, DGR10278_1.jpg).
+ * Instant in-memory check without network latency.
  */
 async function getUniqueFilenameInFolder(baseName, ext = '.jpg') {
   let target = `${baseName}${ext}`;
   let exists = await checkFilenameExistsInFolder(target);
-  if (!exists) return target;
+  if (!exists) {
+    folderFilenameCache.add(target.toLowerCase());
+    return target;
+  }
 
   let counter = 1;
   while (exists) {
     target = `${baseName}_${counter}${ext}`;
     exists = await checkFilenameExistsInFolder(target);
     counter++;
-    if (counter > 50) break;
+    if (counter > 100) break;
   }
+
+  folderFilenameCache.add(target.toLowerCase());
   return target;
 }
 

@@ -28,15 +28,15 @@ async function showStatus() {
     total += row.count;
   }
   
-  // Get last successful conversion
-  const lastSuccess = await db.get(`
-    SELECT filename, completed_at 
+  // Get last 10 successful conversions with timestamps and durations
+  const recentJobs = await db.all(`
+    SELECT filename, target_filename, started_at, completed_at, updated_at
     FROM conversion_queue 
     WHERE status = 'COMPLETED' 
     ORDER BY completed_at DESC 
-    LIMIT 1
+    LIMIT 10
   `);
-  
+
   // Get last error
   const lastError = await db.get(`
     SELECT filename, last_error, updated_at 
@@ -45,10 +45,10 @@ async function showStatus() {
     ORDER BY updated_at DESC 
     LIMIT 1
   `);
-  
-  console.log('\n======================================');
-  console.log('      HEIC CONVERTER QUEUE STATUS     ');
-  console.log('======================================');
+
+  console.log('\n=================================================================================');
+  console.log('                            HEIC CONVERTER QUEUE STATUS                          ');
+  console.log('=================================================================================');
   console.log(`Total Files in Queue: ${total}`);
   console.log(`- Pending:            ${stats.PENDING}`);
   console.log(`- Processing:         ${stats.PROCESSING}`);
@@ -56,23 +56,32 @@ async function showStatus() {
   console.log(`- Failed:             ${stats.FAILED}`);
   console.log(`- Retry Waiting:      ${stats.RETRY_WAIT}`);
   console.log(`- Skipped:            ${stats.SKIPPED}`);
-  console.log('--------------------------------------');
-  
-  if (lastSuccess) {
-    const successTime = new Date(lastSuccess.completed_at).toISOString().replace('T', ' ').substring(0, 19);
-    console.log(`Last Successful Job:  ${lastSuccess.filename} (at ${successTime})`);
+  console.log('---------------------------------------------------------------------------------');
+
+  if (recentJobs && recentJobs.length > 0) {
+    console.log('RECENT COMPLETED & RENAMED FILES:');
+    console.log('Original File         -> Converted/Renamed Name   | Completed At          | Duration');
+    console.log('---------------------------------------------------------------------------------');
+    for (const job of recentJobs) {
+      const orig = (job.filename || '').padEnd(20);
+      const target = (job.target_filename || '').padEnd(24);
+      const timeStr = job.completed_at ? new Date(job.completed_at).toLocaleString() : 'N/A';
+      const durationSec = (job.started_at && job.completed_at) ? `${((job.completed_at - job.started_at) / 1000).toFixed(1)}s` : 'N/A';
+      console.log(`${orig} -> ${target} | ${timeStr.padEnd(21)} | ${durationSec}`);
+    }
   } else {
-    console.log('Last Successful Job:  None');
+    console.log('Recent Completed Files: None yet');
   }
-  
+
+  console.log('---------------------------------------------------------------------------------');
   if (lastError) {
-    const errorTime = new Date(lastError.updated_at).toISOString().replace('T', ' ').substring(0, 19);
+    const errorTime = new Date(lastError.updated_at).toLocaleString();
     console.log(`Last Error:           ${lastError.filename}: ${lastError.last_error} (at ${errorTime})`);
   } else {
     console.log('Last Error:           None');
   }
-  console.log('======================================\n');
-  
+  console.log('=================================================================================\n');
+
   db.db.close();
 }
 

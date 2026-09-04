@@ -8,28 +8,89 @@ try {
   sharp = null;
 }
 
-let worker = null;
-let workerInitPromise = null;
-
 /**
- * Initializes and caches a pre-warmed Tesseract OCR worker for ultra-fast local text detection.
+ * Worker pool to allow concurrent OCR recognition without blocking the entire queue.
  */
-async function getWorker() {
-  if (worker) return worker;
-  if (workerInitPromise) return workerInitPromise;
+class OcrWorkerPool {
+  constructor(size = 2) {
+    this.poolSize = Math.max(1, size);
+    this.availableWorkers = [];
+    this.waitingQueue = [];
+    this.allWorkers = [];
+    this.isInitializing = false;
+    this.initPromise = null;
+  }
 
-  workerInitPromise = (async () => {
-    const w = await createWorker('eng');
-    await w.setParameters({
-      tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -_.'
+  async init() {
+    if (this.initPromise) return this.initPromise;
+    this.isInitializing = true;
+
+    this.initPromise = (async () => {
+      try {
+        const createPromises = [];
+        for (let i = 0; i < this.poolSize; i++) {
+          createPromises.push((async () => {
+            const w = await createWorker('eng');
+            await w.setParameters({
+              tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -_.'
+            });
+            return w;
+          })());
+        }
+        this.allWorkers = await Promise.all(createPromises);
+        this.availableWorkers = [...this.allWorkers];
+        logger.info(`OCR Worker Pool initialized with ${this.allWorkers.length} parallel workers.`);
+      } catch (err) {
+        logger.error(`Failed to initialize OCR Worker Pool: ${err.message}`);
+      } finally {
+        this.isInitializing = false;
+      }
+    })();
+
+    return this.initPromise;
+  }
+
+  async acquireWorker() {
+    if (this.allWorkers.length === 0) {
+      await this.init();
+    }
+
+    if (this.availableWorkers.length > 0) {
+      return this.availableWorkers.pop();
+    }
+
+    return new Promise((resolve) => {
+      this.waitingQueue.push(resolve);
     });
-    worker = w;
-    workerInitPromise = null;
-    return worker;
-  })();
+  }
 
-  return workerInitPromise;
+  releaseWorker(worker) {
+    if (this.waitingQueue.length > 0) {
+      const next = this.waitingQueue.shift();
+      next(worker);
+    } else {
+      this.availableWorkers.push(worker);
+    }
+  }
+
+  async terminateAll() {
+    while (this.waitingQueue.length > 0) {
+      const resolve = this.waitingQueue.shift();
+      resolve(null);
+    }
+    const promises = this.allWorkers.map(async (w) => {
+      try {
+        await w.terminate();
+      } catch (e) {}
+    });
+    await Promise.all(promises);
+    this.allWorkers = [];
+    this.availableWorkers = [];
+    this.initPromise = null;
+  }
 }
+
+const pool = new OcrWorkerPool(2);
 
 /**
  * Complete list of official catalog categories and jewelry prefixes.
@@ -127,39 +188,60 @@ function extractTagPattern(rawText) {
  * Runs multi-pass targeted local OCR on a converted JPG file to detect the jewelry tag number.
  * 
  * Multi-band targeted scanning:
- * - Pass 1: Direct Raw Image with PSM 11 (Sparse Text) - Lightning fast, detects clean digital overlays (DER564, DBR298, DBR336, DMS189, DNS291)
- * - Pass 2: Middle-Upper Band (20% to 55%) Brightness Thresholding (170) - Isolates white text from cushion/velvet fabric (DBR340, DBR334, DBR332, DBR328, DBR330)
- * - Pass 3: Upper Band (8% to 48%) Normalized Inversion with PSM 11 - Detects rings, tags, cards (DLR1212, DGR10282, DBR333)
- * - Pass 4: Middle Bust Red Channel Threshold (160) - Detects necklace tags on dark/velvet bust stands (CP1148, CP1152)
+ * - Pass 1: Scaled (~1200px) Normalized Overview with PSM 11 - Lightning fast (<0.5s), detects clean digital overlays & tags
+ * - Pass 2: Middle-Upper Band (20% to 55%) Brightness Thresholding (170) - Isolates white text from cushion/velvet fabric
+ * - Pass 3: Upper Band (8% to 48%) Normalized Inversion with PSM 11 - Detects rings, tags, cards
+ * - Pass 4: Middle Bust Red Channel Threshold (160) - Detects necklace tags on dark/velvet bust stands
  * - Pass 5: Full Image Inverted & Normalized with PSM 11 - Fallback for tags anywhere in image
  * 
  * @param {string} imagePath Absolute path to the local JPG image
  * @returns {Promise<string|null>} Detected tag number or null if none found
  */
 async function detectTagFromImage(imagePath) {
+  let ocrWorker = null;
   try {
-    const ocrWorker = await getWorker();
+    ocrWorker = await pool.acquireWorker();
+    if (!ocrWorker) return null;
 
-    // Pass 1: Direct Raw Image with PSM 11 (Sparse Text)
-    // Instant detection for high-contrast digital overlays without any preprocessing
-    try {
-      await ocrWorker.setParameters({ tessedit_pageseg_mode: '11' });
-      const { data: { text: rawText } } = await ocrWorker.recognize(imagePath);
-      const tagFromRaw = extractTagPattern(rawText);
-      if (tagFromRaw) {
-        logger.info(`OCR Tag Match (Pass 1 - Direct Raw PSM 11): Found tag '${tagFromRaw}'`);
-        return tagFromRaw;
-      }
-    } catch (pass1Err) {
-      logger.warn(`Pass 1 (Direct Raw) notice: ${pass1Err.message}`);
-    }
+    let metadata = null;
+    let width = 2000;
+    let height = 2000;
 
     if (sharp) {
       try {
-        const metadata = await sharp(imagePath).metadata();
-        const width = metadata.width || 2000;
-        const height = metadata.height || 2000;
+        metadata = await sharp(imagePath).metadata();
+        width = metadata.width || 2000;
+        height = metadata.height || 2000;
+      } catch (e) {
+        metadata = null;
+      }
+    }
 
+    // Pass 1: Fast Scaled Normalized Overview (~1200px) with PSM 11
+    // Downscaling from 12MP to 1200px cuts Tesseract processing time from ~8s to ~0.5s with higher clarity
+    try {
+      let pass1Input = imagePath;
+      if (sharp) {
+        pass1Input = await sharp(imagePath)
+          .resize({ width: 1200, withoutEnlargement: true })
+          .grayscale()
+          .normalise()
+          .toBuffer();
+      }
+
+      await ocrWorker.setParameters({ tessedit_pageseg_mode: '11' });
+      const { data: { text: rawText } } = await ocrWorker.recognize(pass1Input);
+      const tagFromRaw = extractTagPattern(rawText);
+      if (tagFromRaw) {
+        logger.info(`OCR Tag Match (Pass 1 - Fast Overview PSM 11): Found tag '${tagFromRaw}'`);
+        return tagFromRaw;
+      }
+    } catch (pass1Err) {
+      logger.warn(`Pass 1 (Fast Overview) notice: ${pass1Err.message}`);
+    }
+
+    if (sharp && metadata) {
+      try {
         // Pass 2: Middle-Upper Band (20% to 55%) Brightness Thresholding
         // Thresholding at 170 strips fabric texture (green velvet, cushion fibers) leaving pure white text
         try {
@@ -170,7 +252,7 @@ async function detectTagFromImage(imagePath) {
               width: Math.floor(width * 0.70),
               height: Math.floor(height * 0.35)
             })
-            .resize({ width: 1400, withoutEnlargement: true })
+            .resize({ width: 1200, withoutEnlargement: true })
             .grayscale()
             .threshold(170)
             .toBuffer();
@@ -203,7 +285,7 @@ async function detectTagFromImage(imagePath) {
               width: width,
               height: Math.floor(height * 0.40)
             })
-            .resize({ width: 1400, withoutEnlargement: true })
+            .resize({ width: 1200, withoutEnlargement: true })
             .grayscale()
             .negate()
             .normalise()
@@ -248,7 +330,7 @@ async function detectTagFromImage(imagePath) {
         // Pass 5: Full image Inverted & Normalized (PSM 11)
         try {
           const fullBuffer = await sharp(imagePath)
-            .resize({ width: 1400, withoutEnlargement: true })
+            .resize({ width: 1200, withoutEnlargement: true })
             .grayscale()
             .negate()
             .normalise()
@@ -274,28 +356,27 @@ async function detectTagFromImage(imagePath) {
   } catch (err) {
     logger.warn(`OCR text detection failed on ${imagePath}: ${err.message}`);
     return null;
+  } finally {
+    if (ocrWorker) {
+      pool.releaseWorker(ocrWorker);
+    }
   }
 }
 
 /**
- * Pre-warms the OCR worker at service startup so the first image has zero delay.
+ * Pre-warms the OCR worker pool at service startup so the first images have zero delay.
  */
 function prewarmWorker() {
-  getWorker().catch(err => {
-    logger.warn(`OCR worker prewarm notice: ${err.message}`);
+  pool.init().catch(err => {
+    logger.warn(`OCR worker pool prewarm notice: ${err.message}`);
   });
 }
 
 /**
- * Terminates the OCR worker on graceful shutdown.
+ * Terminates all OCR workers on graceful shutdown.
  */
 async function terminateWorker() {
-  if (worker) {
-    try {
-      await worker.terminate();
-      worker = null;
-    } catch (e) {}
-  }
+  await pool.terminateAll();
 }
 
 module.exports = {

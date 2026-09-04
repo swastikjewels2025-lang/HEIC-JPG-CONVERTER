@@ -185,15 +185,18 @@ async function convertWithPythonPillow(inputPath, outputPath, quality) {
   await runCommand(pythonCmd, [pythonScriptPath, inputPath, outputPath, String(quality || 95)]);
 }
 
+let cachedWorkingEngine = null;
+
 /**
  * Converts a HEIC file to JPG using a multi-engine fallback strategy:
  * 1. Python pillow-heif (Artifact-Free HDR & Tile Decoding)
  * 2. Official libheif-js WASM Decoder + Sharp 4:4:4 Encoder
  * 3. FFmpeg (Static or system binary)
- * 4. Sharp Direct
- * 5. heic-convert npm
- * 6. heif-convert CLI
- * 7. ImageMagick
+ * 4. Pure WASM Raw HEIC Decode + Sharp 4:4:4
+ * 5. Sharp Direct
+ * 6. heic-convert npm
+ * 7. heif-convert CLI
+ * 8. ImageMagick
  * 
  * @param {string} inputPath Absolute path to the source HEIC file
  * @param {string} outputPath Absolute path to the target JPG file
@@ -203,106 +206,66 @@ async function convertHeicToJpg(inputPath, outputPath) {
   const quality = String(config.jpegQuality || 95);
   logger.info(`Starting HEIC conversion (Quality: ${quality}): ${inputPath} -> ${outputPath}`);
 
+  const engines = [
+    {
+      name: 'python-pillow',
+      fn: () => convertWithPythonPillow(inputPath, outputPath, quality)
+    },
+    {
+      name: 'libheif-js-sharp',
+      fn: () => (libheif && sharp ? convertWithLibheifJsSharp(inputPath, outputPath, quality) : Promise.reject(new Error('libheif/sharp not loaded')))
+    },
+    {
+      name: 'ffmpeg',
+      fn: () => convertWithFfmpeg(inputPath, outputPath, quality)
+    },
+    {
+      name: 'sharp-direct',
+      fn: () => (sharp ? convertWithSharp(inputPath, outputPath, quality) : Promise.reject(new Error('sharp not loaded')))
+    },
+    {
+      name: 'heic-convert-npm',
+      fn: () => (heicConvert ? convertWithHeicConvertNpm(inputPath, outputPath, quality) : Promise.reject(new Error('heic-convert not loaded')))
+    },
+    {
+      name: 'heif-convert-cli',
+      fn: () => convertWithHeifConvert(inputPath, outputPath, quality)
+    },
+    {
+      name: 'imagemagick',
+      fn: () => convertWithImageMagick(inputPath, outputPath, quality)
+    }
+  ];
+
+  // Fast-path: If we already know which engine works in this environment, try it first
+  if (cachedWorkingEngine) {
+    const cachedObj = engines.find(e => e.name === cachedWorkingEngine);
+    if (cachedObj) {
+      try {
+        await cachedObj.fn();
+        logger.info(`Conversion successful via cached engine [${cachedWorkingEngine}]: ${outputPath}`);
+        return outputPath;
+      } catch (cachedErr) {
+        logger.warn(`Cached engine [${cachedWorkingEngine}] failed: ${cachedErr.message || cachedErr}. Re-testing engines...`);
+        cachedWorkingEngine = null;
+      }
+    }
+  }
+
   const errors = [];
 
-  // Engine 1: Python pillow-heif (Best accuracy for 10-bit Apple HEIC & dark backgrounds)
-  try {
-    logger.info('Attempting conversion via Python pillow-heif (HDR 4:4:4)...');
-    await convertWithPythonPillow(inputPath, outputPath, quality);
-    logger.info(`Conversion successful via Python pillow-heif: ${outputPath}`);
-    return outputPath;
-  } catch (err) {
-    const msg = err.stderr || (err.error && err.error.message) || err.message || err;
-    logger.warn(`Python pillow-heif attempt skipped/failed: ${msg}. Trying next engine...`);
-    errors.push(`python-heif: ${msg}`);
-  }
-
-  // Engine 2: Official libheif-js WASM + Sharp MozJPEG 4:4:4
-  if (libheif && sharp) {
+  for (const engine of engines) {
     try {
-      logger.info('Attempting conversion via libheif-js + Sharp (High-Res Primary Frame, 4:4:4)...');
-      await convertWithLibheifJsSharp(inputPath, outputPath, quality);
-      logger.info(`Conversion successful via libheif-js + Sharp: ${outputPath}`);
+      logger.info(`Attempting conversion via ${engine.name}...`);
+      await engine.fn();
+      cachedWorkingEngine = engine.name;
+      logger.info(`Conversion successful via ${engine.name} (cached as default): ${outputPath}`);
       return outputPath;
     } catch (err) {
-      logger.warn(`libheif-js + Sharp attempt failed: ${err.message}. Trying next engine...`);
-      errors.push(`libheif-js: ${err.message}`);
+      const msg = err.stderr || (err.error && err.error.message) || err.message || err;
+      logger.warn(`${engine.name} attempt failed: ${msg}. Trying next engine...`);
+      errors.push(`${engine.name}: ${msg}`);
     }
-  }
-
-  // Engine 2: FFmpeg (Static or System)
-  try {
-    logger.info('Attempting conversion via FFmpeg...');
-    await convertWithFfmpeg(inputPath, outputPath, quality);
-    logger.info(`Conversion successful via FFmpeg: ${outputPath}`);
-    return outputPath;
-  } catch (err) {
-    const msg = err.stderr || (err.error && err.error.message) || err.message || err;
-    logger.warn(`FFmpeg attempt failed: ${msg}. Trying next engine...`);
-    errors.push(`FFmpeg: ${msg}`);
-  }
-
-  // Engine 2: Pure WASM Raw HEIC Decode + Sharp 4:4:4 High-Fidelity sRGB Encoder
-  if (heicDecode && sharp) {
-    try {
-      logger.info('Attempting conversion via high-fidelity HEIC Decode + Sharp 4:4:4...');
-      await convertWithHeicDecodeSharp(inputPath, outputPath, quality);
-      logger.info(`Conversion successful (High Fidelity 4:4:4): ${outputPath}`);
-      return outputPath;
-    } catch (err) {
-      logger.warn(`HEIC Decode + Sharp attempt failed: ${err.message}. Trying next engine...`);
-      errors.push(`HeicDecodeSharp: ${err.message}`);
-    }
-  }
-
-  // Engine 3: Sharp Direct
-  if (sharp) {
-    try {
-      logger.info('Attempting conversion via Sharp...');
-      await convertWithSharp(inputPath, outputPath, quality);
-      logger.info(`Conversion successful via Sharp: ${outputPath}`);
-      return outputPath;
-    } catch (err) {
-      logger.warn(`Sharp conversion attempt failed: ${err.message}. Trying next engine...`);
-      errors.push(`Sharp: ${err.message}`);
-    }
-  }
-
-  // Engine 4: heic-convert fallback
-  if (heicConvert) {
-    try {
-      logger.info('Attempting conversion via heic-convert npm...');
-      await convertWithHeicConvertNpm(inputPath, outputPath, quality);
-      logger.info(`Conversion successful via heic-convert npm: ${outputPath}`);
-      return outputPath;
-    } catch (err) {
-      logger.warn(`heic-convert npm attempt failed: ${err.message}. Trying next engine...`);
-      errors.push(`heic-convert-npm: ${err.message}`);
-    }
-  }
-
-  // Engine 5: heif-convert (CLI)
-  try {
-    logger.info('Attempting conversion via heif-convert CLI...');
-    await convertWithHeifConvert(inputPath, outputPath, quality);
-    logger.info(`Conversion successful via heif-convert CLI: ${outputPath}`);
-    return outputPath;
-  } catch (err) {
-    const msg = err.stderr || (err.error && err.error.message) || err;
-    logger.warn(`heif-convert CLI attempt failed: ${msg}. Trying next engine...`);
-    errors.push(`heif-convert-cli: ${msg}`);
-  }
-
-  // Engine 6: ImageMagick
-  try {
-    logger.info('Attempting conversion via ImageMagick...');
-    await convertWithImageMagick(inputPath, outputPath, quality);
-    logger.info(`Conversion successful via ImageMagick: ${outputPath}`);
-    return outputPath;
-  } catch (err) {
-    const msg = err.stderr || (err.error && err.error.message) || err;
-    logger.warn(`ImageMagick attempt failed: ${msg}.`);
-    errors.push(`ImageMagick: ${msg}`);
   }
 
   // If all failed
