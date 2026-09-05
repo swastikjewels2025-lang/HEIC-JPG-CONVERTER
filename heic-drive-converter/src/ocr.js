@@ -4,6 +4,10 @@ const logger = require('./logger');
 let sharp;
 try {
   sharp = require('sharp');
+  if (sharp) {
+    sharp.cache(false);
+    sharp.simd(true);
+  }
 } catch (e) {
   sharp = null;
 }
@@ -90,7 +94,7 @@ class OcrWorkerPool {
   }
 }
 
-const pool = new OcrWorkerPool(4);
+const pool = new OcrWorkerPool(1);
 
 /**
  * Complete list of official catalog categories and jewelry prefixes.
@@ -327,6 +331,7 @@ async function detectTagFromImage(imagePath) {
     logger.warn(`OCR text detection failed on ${imagePath}: ${err.message}`);
     return null;
   } finally {
+    imageBuffer = null;
     if (ocrWorker) {
       pool.releaseWorker(ocrWorker);
     }

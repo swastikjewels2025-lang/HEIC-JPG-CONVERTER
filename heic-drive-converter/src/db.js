@@ -47,8 +47,12 @@ function all(sql, params = []) {
   });
 }
 
-// Initialize tables
+// Initialize tables and PRAGMAs
 async function init() {
+  await run('PRAGMA journal_mode = WAL;');
+  await run('PRAGMA busy_timeout = 10000;');
+  await run('PRAGMA synchronous = NORMAL;');
+
   const sql = `
     CREATE TABLE IF NOT EXISTS conversion_queue (
       file_id TEXT PRIMARY KEY,
@@ -67,7 +71,7 @@ async function init() {
     )
   `;
   await run(sql);
-  logger.info('Database schema verified/initialized successfully.');
+  logger.info('Database schema and WAL PRAGMAs verified/initialized successfully.');
 }
 
 module.exports = {

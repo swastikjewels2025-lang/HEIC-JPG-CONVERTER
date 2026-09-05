@@ -137,11 +137,19 @@ async function handleJobFailure(fileId, errorMsg) {
  * Cleans up temporary files if they exist on the VPS.
  */
 function cleanTempFiles(heicPath, jpgPath) {
-  try {
-    if (heicPath && fs.existsSync(heicPath)) fs.unlinkSync(heicPath);
-    if (jpgPath && fs.existsSync(jpgPath)) fs.unlinkSync(jpgPath);
-  } catch (err) {
-    logger.warn(`Failed to clean up temp files: ${err.message}`);
+  if (heicPath) {
+    try {
+      if (fs.existsSync(heicPath)) fs.unlinkSync(heicPath);
+    } catch (err) {
+      logger.warn(`Failed to clean up HEIC temp file (${heicPath}): ${err.message}`);
+    }
+  }
+  if (jpgPath) {
+    try {
+      if (fs.existsSync(jpgPath)) fs.unlinkSync(jpgPath);
+    } catch (err) {
+      logger.warn(`Failed to clean up JPG temp file (${jpgPath}): ${err.message}`);
+    }
   }
 }
 
@@ -254,14 +262,14 @@ async function processQueue() {
 
     activeConversions++;
     // Trigger queue processor again for other concurrent slots
-    processQueue();
+    processQueue().catch(err => logger.error('Error in concurrent queue slot: ', err));
 
     try {
       await processJob(job);
     } finally {
       activeConversions--;
       // Run loop again to fetch next job
-      processQueue();
+      processQueue().catch(err => logger.error('Error in next queue step: ', err));
     }
   } catch (err) {
     logger.error('Error occurred in queue loop: ', err);

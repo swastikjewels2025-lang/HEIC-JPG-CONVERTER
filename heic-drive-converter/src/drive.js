@@ -83,32 +83,40 @@ async function listFolderFiles() {
  */
 async function downloadFile(fileId, localPath) {
   const dest = fs.createWriteStream(localPath);
-  const res = await drive.files.get(
-    { fileId, alt: 'media', supportsAllDrives: true },
-    { responseType: 'stream' }
-  );
+  try {
+    const res = await drive.files.get(
+      { fileId, alt: 'media', supportsAllDrives: true },
+      { responseType: 'stream' }
+    );
 
-  return new Promise((resolve, reject) => {
-    let hasError = false;
-    
-    res.data
-      .on('error', (err) => {
-        hasError = true;
-        reject(err);
-      })
-      .pipe(dest);
+    return await new Promise((resolve, reject) => {
+      let finished = false;
 
-    dest.on('finish', () => {
-      if (!hasError) {
-        resolve(localPath);
-      }
+      const cleanup = (err) => {
+        if (!finished) {
+          finished = true;
+          dest.destroy();
+          reject(err);
+        }
+      };
+
+      res.data
+        .on('error', cleanup)
+        .pipe(dest);
+
+      dest.on('finish', () => {
+        if (!finished) {
+          finished = true;
+          resolve(localPath);
+        }
+      });
+
+      dest.on('error', cleanup);
     });
-
-    dest.on('error', (err) => {
-      hasError = true;
-      reject(err);
-    });
-  });
+  } catch (err) {
+    dest.destroy();
+    throw err;
+  }
 }
 
 /**
@@ -119,26 +127,32 @@ async function downloadFile(fileId, localPath) {
  * @returns {Promise<Object>} Google Drive file metadata object
  */
 async function uploadFile(filename, localPath) {
-  const fileMetadata = {
-    name: filename,
-    parents: [config.driveFolderId]
-  };
-  const media = {
-    mimeType: 'image/jpeg',
-    body: fs.createReadStream(localPath)
-  };
+  const readStream = fs.createReadStream(localPath);
+  try {
+    const fileMetadata = {
+      name: filename,
+      parents: [config.driveFolderId]
+    };
+    const media = {
+      mimeType: 'image/jpeg',
+      body: readStream
+    };
 
-  const res = await drive.files.create({
-    requestBody: fileMetadata,
-    media: media,
-    fields: 'id, name, size',
-    supportsAllDrives: true
-  });
+    const res = await drive.files.create({
+      requestBody: fileMetadata,
+      media: media,
+      fields: 'id, name, size',
+      supportsAllDrives: true
+    });
 
-  // Add uploaded file to local filename cache
-  folderFilenameCache.add(filename.toLowerCase());
+    // Add uploaded file to local filename cache
+    folderFilenameCache.add(filename.toLowerCase());
 
-  return res.data;
+    return res.data;
+  } catch (err) {
+    readStream.destroy();
+    throw err;
+  }
 }
 
 /**

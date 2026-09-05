@@ -104,7 +104,7 @@ async function checkFolder() {
     }
 
     // Trigger queue processor
-    queue.processQueue();
+    queue.processQueue().catch(err => logger.error('Error starting queue processing: ', err));
 
   } catch (err) {
     logger.error('Error during periodic folder check: ', err);
@@ -119,6 +119,14 @@ async function startDaemon() {
   logger.info(`Test Mode: ${config.testMode}`);
   logger.info(`Max Concurrency: ${config.maxConcurrentConversions}`);
   logger.info(`Poll Interval: ${config.pollIntervalMs / 1000}s`);
+
+  // Global uncaught handlers to prevent unexpected process crashes
+  process.on('uncaughtException', (err) => {
+    logger.error('Uncaught Exception in daemon process: ', err);
+  });
+  process.on('unhandledRejection', (reason) => {
+    logger.error('Unhandled Promise Rejection in daemon process: ', reason);
+  });
 
   // Initialize DB
   await db.init();
@@ -146,6 +154,12 @@ async function startDaemon() {
     while (queue.getActiveCount() > 0 && Date.now() < timeout) {
       logger.info(`Awaiting completion of ${queue.getActiveCount()} active workers...`);
       await new Promise(r => setTimeout(r, 1000));
+    }
+
+    try {
+      await ocr.terminateWorker();
+    } catch (ocrErr) {
+      logger.warn(`Error terminating OCR worker during shutdown: ${ocrErr.message}`);
     }
 
     logger.info('Closing database connection...');

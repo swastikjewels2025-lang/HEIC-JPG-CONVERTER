@@ -114,7 +114,7 @@ async function runScan() {
   
   // 5. Start queue workers to process the backlog
   logger.info('Starting queue workers to process bulk backlog...');
-  queue.processQueue();
+  queue.processQueue().catch(err => logger.error('Error in bulk queue processing: ', err));
   
   // Keep the process alive and monitor completion status
   const monitorInterval = setInterval(async () => {

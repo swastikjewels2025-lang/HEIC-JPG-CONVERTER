@@ -13,6 +13,10 @@ try {
 let sharp;
 try {
   sharp = require('sharp');
+  if (sharp) {
+    sharp.cache(false);
+    sharp.simd(true);
+  }
 } catch (e) {
   sharp = null;
 }
@@ -61,9 +65,11 @@ async function convertWithLibheifJsSharp(inputPath, outputPath, quality) {
   if (!libheif) throw new Error('libheif-js module not loaded');
   if (!sharp) throw new Error('sharp module not loaded');
 
-  const inputBuffer = await fs.promises.readFile(inputPath);
+  let inputBuffer = await fs.promises.readFile(inputPath);
   const decoder = new libheif.HeifDecoder();
   const data = decoder.decode(inputBuffer);
+  inputBuffer = null; // Free input buffer reference immediately
+
   if (!data || !data.length) {
     throw new Error('No images found in HEIF file');
   }
@@ -126,13 +132,14 @@ async function convertWithSharp(inputPath, outputPath, quality) {
  */
 async function convertWithHeicConvertNpm(inputPath, outputPath, quality) {
   if (!heicConvert) throw new Error('heic-convert npm module not loaded');
-  const inputBuffer = await fs.promises.readFile(inputPath);
+  let inputBuffer = await fs.promises.readFile(inputPath);
   const qFloat = Math.min(Math.max((parseInt(quality, 10) || 92) / 100, 0.1), 1.0);
   const outputBuffer = await heicConvert({
     buffer: inputBuffer,
     format: 'JPEG',
     quality: qFloat
   });
+  inputBuffer = null;
   await fs.promises.writeFile(outputPath, outputBuffer);
 }
 
