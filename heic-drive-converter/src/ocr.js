@@ -166,27 +166,23 @@ function extractTagPattern(rawText) {
     const escapedPrefix = prefix.replace(/\s+/g, '\\s*');
 
     const minDigits = cleanPrefix.length <= 2 ? 3 : 2;
-    // Allow digits with optional single spaces between them (e.g. "DBR32 8" -> "DBR328", "DBR 334" -> "DBR334")
-    const regex = new RegExp(`\\b${escapedPrefix}\\s*[-_]?\\s*(\\d(?:\\s*\\d){${minDigits - 1},7})\\b`, 'i');
+    // Match prefix followed by contiguous digits (prevents merging stray background numbers like "PS1554 8" -> "PS1554")
+    const regex = new RegExp(`\\b${escapedPrefix}\\s*[-_]?\\s*(\\d{${minDigits},6})\\b`, 'i');
 
     for (const line of lines) {
       const match = regex.exec(line);
       if (match) {
-        const digits = match[1].replace(/\s+/g, '');
-        if (digits.length >= minDigits) {
-          return `${cleanPrefix}${digits}`;
-        }
+        return `${cleanPrefix}${match[1]}`;
       }
     }
 
     // Ghost character handling (e.g. DERS556 -> DER556)
     if (cleanPrefix.length >= 3) {
-      const ghostRegex = new RegExp(`\\b${escapedPrefix}[S\\-_\\s]+(\\d(?:\\s*\\d){${minDigits - 1},7})\\b`, 'i');
+      const ghostRegex = new RegExp(`\\b${escapedPrefix}[S\\-_\\s]+(\\d{${minDigits},6})\\b`, 'i');
       for (const line of lines) {
         const match = ghostRegex.exec(line);
         if (match) {
-          const digits = match[1].replace(/\s+/g, '');
-          return `${cleanPrefix}${digits}`;
+          return `${cleanPrefix}${match[1]}`;
         }
       }
 
@@ -206,8 +202,8 @@ function extractTagPattern(rawText) {
     }
   }
 
-  // Priority 2: General jewelry catalog prefix matching (prevents random noise like DDOY000)
-  const generalRegex = /\b([A-Z]{3,5})\s*[-_]?\s*(\d{2,7})\b/;
+  // Priority 2: General jewelry catalog prefix matching
+  const generalRegex = /\b([A-Z]{3,5})\s*[-_]?\s*(\d{2,6})\b/;
   for (const line of lines) {
     const match = generalRegex.exec(line);
     if (match) {
@@ -264,8 +260,8 @@ async function detectTagFromImage(imagePath) {
       }
     }
 
-    // Pass 1: Upper-Middle 70% Crop (~900px) with PSM 6
-    // Reads digital overlays (DER564, DBR298, DMS189, DNS291, DGR10286, DGR10282) in ~0.15s
+    // Pass 1: Upper 75% High-Res Crop (width ~1800px) with PSM 11 (Sparse Text / Overlays)
+    // Retains character height so small text like DER567, DER556, DBR328 is sharp and easily readable
     try {
       let pass1Input = imageBuffer;
       if (sharp && metadata) {
@@ -274,19 +270,28 @@ async function detectTagFromImage(imagePath) {
             left: 0,
             top: 0,
             width: width,
-            height: Math.floor(height * 0.70)
+            height: Math.floor(height * 0.75)
           })
-          .resize({ width: 900, withoutEnlargement: true })
+          .resize({ width: 1800, withoutEnlargement: true })
           .grayscale()
           .normalise()
           .toBuffer();
       }
 
+      await ocrWorker.setParameters({ tessedit_pageseg_mode: '11' });
+      const { data: { text: textPsm11 } } = await ocrWorker.recognize(pass1Input);
+      const tagPsm11 = extractTagPattern(textPsm11);
+      if (tagPsm11) {
+        logger.info(`OCR Tag Match (Pass 1 - Upper High-Res PSM 11): Found tag '${tagPsm11}'`);
+        return tagPsm11;
+      }
+
+      // Fast fallback to PSM 6 on same buffer if PSM 11 found nothing
       await ocrWorker.setParameters({ tessedit_pageseg_mode: '6' });
       const { data: { text: textPsm6 } } = await ocrWorker.recognize(pass1Input);
       const tagPsm6 = extractTagPattern(textPsm6);
       if (tagPsm6) {
-        logger.info(`OCR Tag Match (Pass 1 - Upper PSM 6): Found tag '${tagPsm6}'`);
+        logger.info(`OCR Tag Match (Pass 1 - Upper High-Res PSM 6): Found tag '${tagPsm6}'`);
         return tagPsm6;
       }
     } catch (pass1Err) {
@@ -297,57 +302,31 @@ async function detectTagFromImage(imagePath) {
       try {
         await new Promise(r => setImmediate(r));
 
-        // Pass 2: Center-Middle Band (10% to 75%) Brightness Thresholding
-        // Thresholding at 145 strips green velvet & cushion fabric leaving pure white text (e.g. DBR336)
+        // Pass 2: Velvet Cushion / Dark Background Thresholding (10% to 75% band)
+        // High-contrast binary mask isolates pure white text on green cushions (DBR328, DBR340) and black gloves
         try {
           const threshBuf = await sharp(imageBuffer)
             .extract({
               left: 0,
-              top: Math.floor(height * 0.10),
-              width: width,
-              height: Math.floor(height * 0.65)
-            })
-            .resize({ width: 900, withoutEnlargement: true })
-            .grayscale()
-            .threshold(145)
-            .toBuffer();
-
-          const { data: { text: thText6 } } = await ocrWorker.recognize(threshBuf);
-          const tagTh6 = extractTagPattern(thText6);
-          if (tagTh6) {
-            logger.info(`OCR Tag Match (Pass 2 - Threshold PSM 6): Found tag '${tagTh6}'`);
-            return tagTh6;
-          }
-        } catch (pass2Err) {
-          logger.warn(`Pass 2 (Threshold) notice: ${pass2Err.message}`);
-        }
-
-        await new Promise(r => setImmediate(r));
-
-        // Pass 3: Inverted & Normalized (Cards, rings, dark tags, fan ornaments)
-        try {
-          const topBuffer = await sharp(imageBuffer)
-            .extract({
-              left: 0,
               top: Math.floor(height * 0.05),
               width: width,
-              height: Math.floor(height * 0.55)
+              height: Math.floor(height * 0.70)
             })
-            .resize({ width: 900, withoutEnlargement: true })
+            .resize({ width: 1800, withoutEnlargement: true })
             .grayscale()
-            .negate()
-            .normalise()
+            .threshold(135)
+            .negate() // Black text on white background is optimal for Tesseract
             .toBuffer();
 
           await ocrWorker.setParameters({ tessedit_pageseg_mode: '11' });
-          const { data: { text: text3 } } = await ocrWorker.recognize(topBuffer);
-          const tag3 = extractTagPattern(text3);
-          if (tag3) {
-            logger.info(`OCR Tag Match (Pass 3 - Inverted PSM 11): Found tag '${tag3}'`);
-            return tag3;
+          const { data: { text: thText } } = await ocrWorker.recognize(threshBuf);
+          const tagTh = extractTagPattern(thText);
+          if (tagTh) {
+            logger.info(`OCR Tag Match (Pass 2 - Contrast Invert PSM 11): Found tag '${tagTh}'`);
+            return tagTh;
           }
-        } catch (pass3Err) {
-          logger.warn(`Pass 3 (Inverted) notice: ${pass3Err.message}`);
+        } catch (pass2Err) {
+          logger.warn(`Pass 2 (Threshold) notice: ${pass2Err.message}`);
         }
 
       } catch (prepErr) {
