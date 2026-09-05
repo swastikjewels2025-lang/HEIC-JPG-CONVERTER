@@ -90,7 +90,7 @@ class OcrWorkerPool {
   }
 }
 
-const pool = new OcrWorkerPool(2);
+const pool = new OcrWorkerPool(4);
 
 /**
  * Complete list of official catalog categories and jewelry prefixes.
@@ -188,11 +188,10 @@ function extractTagPattern(rawText) {
  * Runs multi-pass targeted local OCR on a converted JPG file to detect the jewelry tag number.
  * 
  * Multi-band targeted scanning:
- * - Pass 1: Scaled (~1200px) Normalized Overview with PSM 11 - Lightning fast (<0.5s), detects clean digital overlays & tags
+ * - Pass 1: Upper 60% Crop (~1000px) with PSM 6/11 - Lightning fast (<0.2s), avoids bottom jewelry reflections
  * - Pass 2: Middle-Upper Band (20% to 55%) Brightness Thresholding (170) - Isolates white text from cushion/velvet fabric
  * - Pass 3: Upper Band (8% to 48%) Normalized Inversion with PSM 11 - Detects rings, tags, cards
  * - Pass 4: Middle Bust Red Channel Threshold (160) - Detects necklace tags on dark/velvet bust stands
- * - Pass 5: Full Image Inverted & Normalized with PSM 11 - Fallback for tags anywhere in image
  * 
  * @param {string} imagePath Absolute path to the local JPG image
  * @returns {Promise<string|null>} Detected tag number or null if none found
@@ -217,27 +216,41 @@ async function detectTagFromImage(imagePath) {
       }
     }
 
-    // Pass 1: Fast Scaled Normalized Overview (~1200px) with PSM 11
-    // Downscaling from 12MP to 1200px cuts Tesseract processing time from ~8s to ~0.5s with higher clarity
+    // Pass 1: Upper 60% Focused Crop (~1000px) with PSM 6
+    // Eliminates all bottom jewelry reflections (rings, bracelets, chains) and reads overlays in ~0.15s
     try {
       let pass1Input = imagePath;
-      if (sharp) {
+      if (sharp && metadata) {
         pass1Input = await sharp(imagePath)
-          .resize({ width: 1200, withoutEnlargement: true })
+          .extract({
+            left: 0,
+            top: 0,
+            width: width,
+            height: Math.floor(height * 0.65)
+          })
+          .resize({ width: 1000, withoutEnlargement: true })
           .grayscale()
           .normalise()
           .toBuffer();
       }
 
+      await ocrWorker.setParameters({ tessedit_pageseg_mode: '6' });
+      const { data: { text: textPsm6 } } = await ocrWorker.recognize(pass1Input);
+      const tagPsm6 = extractTagPattern(textPsm6);
+      if (tagPsm6) {
+        logger.info(`OCR Tag Match (Pass 1 - Upper PSM 6): Found tag '${tagPsm6}'`);
+        return tagPsm6;
+      }
+
       await ocrWorker.setParameters({ tessedit_pageseg_mode: '11' });
-      const { data: { text: rawText } } = await ocrWorker.recognize(pass1Input);
-      const tagFromRaw = extractTagPattern(rawText);
-      if (tagFromRaw) {
-        logger.info(`OCR Tag Match (Pass 1 - Fast Overview PSM 11): Found tag '${tagFromRaw}'`);
-        return tagFromRaw;
+      const { data: { text: textPsm11 } } = await ocrWorker.recognize(pass1Input);
+      const tagPsm11 = extractTagPattern(textPsm11);
+      if (tagPsm11) {
+        logger.info(`OCR Tag Match (Pass 1 - Upper PSM 11): Found tag '${tagPsm11}'`);
+        return tagPsm11;
       }
     } catch (pass1Err) {
-      logger.warn(`Pass 1 (Fast Overview) notice: ${pass1Err.message}`);
+      logger.warn(`Pass 1 (Upper Focus) notice: ${pass1Err.message}`);
     }
 
     if (sharp && metadata) {
@@ -247,30 +260,30 @@ async function detectTagFromImage(imagePath) {
         try {
           const threshBuf = await sharp(imagePath)
             .extract({
-              left: Math.floor(width * 0.15),
-              top: Math.floor(height * 0.20),
-              width: Math.floor(width * 0.70),
-              height: Math.floor(height * 0.35)
+              left: Math.floor(width * 0.10),
+              top: Math.floor(height * 0.15),
+              width: Math.floor(width * 0.80),
+              height: Math.floor(height * 0.45)
             })
-            .resize({ width: 1200, withoutEnlargement: true })
+            .resize({ width: 1000, withoutEnlargement: true })
             .grayscale()
-            .threshold(170)
+            .threshold(160)
             .toBuffer();
-
-          await ocrWorker.setParameters({ tessedit_pageseg_mode: '11' });
-          const { data: { text: thText11 } } = await ocrWorker.recognize(threshBuf);
-          const tagTh11 = extractTagPattern(thText11);
-          if (tagTh11) {
-            logger.info(`OCR Tag Match (Pass 2 - Mid-Upper Threshold PSM 11): Found tag '${tagTh11}'`);
-            return tagTh11;
-          }
 
           await ocrWorker.setParameters({ tessedit_pageseg_mode: '6' });
           const { data: { text: thText6 } } = await ocrWorker.recognize(threshBuf);
           const tagTh6 = extractTagPattern(thText6);
           if (tagTh6) {
-            logger.info(`OCR Tag Match (Pass 2 - Mid-Upper Threshold PSM 6): Found tag '${tagTh6}'`);
+            logger.info(`OCR Tag Match (Pass 2 - Threshold PSM 6): Found tag '${tagTh6}'`);
             return tagTh6;
+          }
+
+          await ocrWorker.setParameters({ tessedit_pageseg_mode: '11' });
+          const { data: { text: thText11 } } = await ocrWorker.recognize(threshBuf);
+          const tagTh11 = extractTagPattern(thText11);
+          if (tagTh11) {
+            logger.info(`OCR Tag Match (Pass 2 - Threshold PSM 11): Found tag '${tagTh11}'`);
+            return tagTh11;
           }
         } catch (pass2Err) {
           logger.warn(`Pass 2 (Threshold) notice: ${pass2Err.message}`);
@@ -285,7 +298,7 @@ async function detectTagFromImage(imagePath) {
               width: width,
               height: Math.floor(height * 0.40)
             })
-            .resize({ width: 1200, withoutEnlargement: true })
+            .resize({ width: 1000, withoutEnlargement: true })
             .grayscale()
             .negate()
             .normalise()
@@ -325,26 +338,6 @@ async function detectTagFromImage(imagePath) {
           }
         } catch (pass4Err) {
           logger.warn(`Pass 4 (Middle Red Channel) notice: ${pass4Err.message}`);
-        }
-
-        // Pass 5: Full image Inverted & Normalized (PSM 11)
-        try {
-          const fullBuffer = await sharp(imagePath)
-            .resize({ width: 1200, withoutEnlargement: true })
-            .grayscale()
-            .negate()
-            .normalise()
-            .toBuffer();
-
-          await ocrWorker.setParameters({ tessedit_pageseg_mode: '11' });
-          const { data: { text: text5 } } = await ocrWorker.recognize(fullBuffer);
-          const tag5 = extractTagPattern(text5);
-          if (tag5) {
-            logger.info(`OCR Tag Match (Pass 5 - Full Normalized PSM 11): Found tag '${tag5}'`);
-            return tag5;
-          }
-        } catch (pass5Err) {
-          logger.warn(`Pass 5 (Full Inverted) notice: ${pass5Err.message}`);
         }
 
       } catch (prepErr) {
