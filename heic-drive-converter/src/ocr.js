@@ -181,14 +181,28 @@ function extractTagPattern(rawText) {
   return null;
 }
 
+const fs = require('fs');
+
 /**
- * Internal multi-pass OCR scan with focused crops.
+ * Runs multi-pass targeted local OCR on a converted JPG file to detect jewelry catalog tag numbers.
+ * 
+ * @param {string} imagePath Absolute path to the local JPG image
+ * @returns {Promise<string|null>} Detected tag number or null if none found
  */
-async function detectTagInternal(imagePath) {
+async function detectTagFromImage(imagePath) {
   let ocrWorker = null;
   try {
     ocrWorker = await pool.acquireWorker();
     if (!ocrWorker) return null;
+
+    // Read image into memory buffer once to prevent any race condition with temporary file deletion
+    let imageBuffer;
+    try {
+      imageBuffer = await fs.promises.readFile(imagePath);
+    } catch (readErr) {
+      logger.warn(`Failed to read image buffer for OCR: ${readErr.message}`);
+      return null;
+    }
 
     let metadata = null;
     let width = 2000;
@@ -196,7 +210,7 @@ async function detectTagInternal(imagePath) {
 
     if (sharp) {
       try {
-        metadata = await sharp(imagePath).metadata();
+        metadata = await sharp(imageBuffer).metadata();
         width = metadata.width || 2000;
         height = metadata.height || 2000;
       } catch (e) {
@@ -205,11 +219,11 @@ async function detectTagInternal(imagePath) {
     }
 
     // Pass 1: Upper-Middle 70% Crop (~900px) with PSM 6 then PSM 11
-    // Fast (<0.15s), avoids bottom jewelry reflections
+    // Reads digital overlays (DER564, DBR298, DMS189, DNS291, DGR10286, DGR10282) in ~0.15s
     try {
-      let pass1Input = imagePath;
+      let pass1Input = imageBuffer;
       if (sharp && metadata) {
-        pass1Input = await sharp(imagePath)
+        pass1Input = await sharp(imageBuffer)
           .extract({
             left: 0,
             top: 0,
@@ -244,9 +258,9 @@ async function detectTagInternal(imagePath) {
     if (sharp && metadata) {
       try {
         // Pass 2: Center-Middle Band (10% to 75%) Brightness Thresholding
-        // Thresholding at 150 strips green velvet & cushion fabric leaving pure white text
+        // Thresholding at 150 strips green velvet & cushion fabric leaving pure white text (e.g. DBR336)
         try {
-          const threshBuf = await sharp(imagePath)
+          const threshBuf = await sharp(imageBuffer)
             .extract({
               left: 0,
               top: Math.floor(height * 0.10),
@@ -279,7 +293,7 @@ async function detectTagInternal(imagePath) {
 
         // Pass 3: Inverted & Normalized (Cards, rings, dark tags)
         try {
-          const topBuffer = await sharp(imagePath)
+          const topBuffer = await sharp(imageBuffer)
             .extract({
               left: 0,
               top: Math.floor(height * 0.08),
@@ -317,19 +331,6 @@ async function detectTagInternal(imagePath) {
       pool.releaseWorker(ocrWorker);
     }
   }
-}
-
-/**
- * Runs multi-pass targeted local OCR on a converted JPG file with a 4-second timeout limit.
- * 
- * @param {string} imagePath Absolute path to the local JPG image
- * @returns {Promise<string|null>} Detected tag number or null if none found
- */
-async function detectTagFromImage(imagePath) {
-  return Promise.race([
-    detectTagInternal(imagePath),
-    new Promise(resolve => setTimeout(() => resolve(null), 4000))
-  ]);
 }
 
 /**
