@@ -160,23 +160,20 @@ function extractTagPattern(rawText) {
     }
   }
 
-  // Priority 2: General jewelry model format: 3-5 uppercase letters + 2-7 digits (e.g. AADI10286)
+  // Priority 2: General jewelry catalog prefix matching (prevents random noise like DDOY000)
   const generalRegex = /\b([A-Z]{3,5})\s*[-_]?\s*(\d{2,7})\b/;
   for (const line of lines) {
     const match = generalRegex.exec(line);
     if (match) {
-      let p = match[1];
+      const candidatePrefix = match[1];
       const digits = match[2];
-      if (!BLACKLIST.has(p)) {
-        // If candidate prefix starts with a known catalog prefix (e.g. DERS -> DER), normalize to official prefix
+      if (!BLACKLIST.has(candidatePrefix)) {
         for (const known of JEWELRY_CATALOG_PREFIXES) {
           const cleanKnown = known.replace(/\s+/g, '');
-          if (cleanKnown.length >= 3 && p.startsWith(cleanKnown)) {
-            p = cleanKnown;
-            break;
+          if (cleanKnown.length >= 3 && candidatePrefix.startsWith(cleanKnown)) {
+            return `${cleanKnown}${digits}`;
           }
         }
-        return `${p}${digits}`;
       }
     }
   }
@@ -185,18 +182,9 @@ function extractTagPattern(rawText) {
 }
 
 /**
- * Runs multi-pass targeted local OCR on a converted JPG file to detect the jewelry tag number.
- * 
- * Multi-band targeted scanning:
- * - Pass 1: Upper 60% Crop (~1000px) with PSM 6/11 - Lightning fast (<0.2s), avoids bottom jewelry reflections
- * - Pass 2: Middle-Upper Band (20% to 55%) Brightness Thresholding (170) - Isolates white text from cushion/velvet fabric
- * - Pass 3: Upper Band (8% to 48%) Normalized Inversion with PSM 11 - Detects rings, tags, cards
- * - Pass 4: Middle Bust Red Channel Threshold (160) - Detects necklace tags on dark/velvet bust stands
- * 
- * @param {string} imagePath Absolute path to the local JPG image
- * @returns {Promise<string|null>} Detected tag number or null if none found
+ * Internal multi-pass OCR scan with focused crops.
  */
-async function detectTagFromImage(imagePath) {
+async function detectTagInternal(imagePath) {
   let ocrWorker = null;
   try {
     ocrWorker = await pool.acquireWorker();
@@ -216,8 +204,8 @@ async function detectTagFromImage(imagePath) {
       }
     }
 
-    // Pass 1: Upper 60% Focused Crop (~1000px) with PSM 6
-    // Eliminates all bottom jewelry reflections (rings, bracelets, chains) and reads overlays in ~0.15s
+    // Pass 1: Upper-Middle 70% Crop (~900px) with PSM 6 then PSM 11
+    // Fast (<0.15s), avoids bottom jewelry reflections
     try {
       let pass1Input = imagePath;
       if (sharp && metadata) {
@@ -226,9 +214,9 @@ async function detectTagFromImage(imagePath) {
             left: 0,
             top: 0,
             width: width,
-            height: Math.floor(height * 0.65)
+            height: Math.floor(height * 0.70)
           })
-          .resize({ width: 1000, withoutEnlargement: true })
+          .resize({ width: 900, withoutEnlargement: true })
           .grayscale()
           .normalise()
           .toBuffer();
@@ -255,19 +243,19 @@ async function detectTagFromImage(imagePath) {
 
     if (sharp && metadata) {
       try {
-        // Pass 2: Middle-Upper Band (20% to 55%) Brightness Thresholding
-        // Thresholding at 170 strips fabric texture (green velvet, cushion fibers) leaving pure white text
+        // Pass 2: Center-Middle Band (10% to 75%) Brightness Thresholding
+        // Thresholding at 150 strips green velvet & cushion fabric leaving pure white text
         try {
           const threshBuf = await sharp(imagePath)
             .extract({
-              left: Math.floor(width * 0.10),
-              top: Math.floor(height * 0.15),
-              width: Math.floor(width * 0.80),
-              height: Math.floor(height * 0.45)
+              left: 0,
+              top: Math.floor(height * 0.10),
+              width: width,
+              height: Math.floor(height * 0.65)
             })
-            .resize({ width: 1000, withoutEnlargement: true })
+            .resize({ width: 900, withoutEnlargement: true })
             .grayscale()
-            .threshold(160)
+            .threshold(150)
             .toBuffer();
 
           await ocrWorker.setParameters({ tessedit_pageseg_mode: '6' });
@@ -289,16 +277,16 @@ async function detectTagFromImage(imagePath) {
           logger.warn(`Pass 2 (Threshold) notice: ${pass2Err.message}`);
         }
 
-        // Pass 3: Upper Band (8% to 48%) Normalized Inversion with PSM 11 (Cards, rings, tags)
+        // Pass 3: Inverted & Normalized (Cards, rings, dark tags)
         try {
           const topBuffer = await sharp(imagePath)
             .extract({
               left: 0,
               top: Math.floor(height * 0.08),
               width: width,
-              height: Math.floor(height * 0.40)
+              height: Math.floor(height * 0.50)
             })
-            .resize({ width: 1000, withoutEnlargement: true })
+            .resize({ width: 900, withoutEnlargement: true })
             .grayscale()
             .negate()
             .normalise()
@@ -308,36 +296,11 @@ async function detectTagFromImage(imagePath) {
           const { data: { text: text3 } } = await ocrWorker.recognize(topBuffer);
           const tag3 = extractTagPattern(text3);
           if (tag3) {
-            logger.info(`OCR Tag Match (Pass 3 - Upper Band Inverted PSM 11): Found tag '${tag3}'`);
+            logger.info(`OCR Tag Match (Pass 3 - Inverted PSM 11): Found tag '${tag3}'`);
             return tag3;
           }
         } catch (pass3Err) {
-          logger.warn(`Pass 3 (Upper Band) notice: ${pass3Err.message}`);
-        }
-
-        // Pass 4: Middle Bust (20% to 50%) - Red Channel Threshold (Necklaces: CP1148, CP1152)
-        try {
-          const midA = await sharp(imagePath)
-            .extract({
-              left: Math.floor(width * 0.15),
-              top: Math.floor(height * 0.20),
-              width: Math.floor(width * 0.70),
-              height: Math.floor(height * 0.30)
-            })
-            .extractChannel('red')
-            .threshold(160)
-            .negate()
-            .toBuffer();
-
-          await ocrWorker.setParameters({ tessedit_pageseg_mode: '6' });
-          const { data: { text: text4 } } = await ocrWorker.recognize(midA);
-          const tag4 = extractTagPattern(text4);
-          if (tag4) {
-            logger.info(`OCR Tag Match (Pass 4 - Middle Red Channel PSM 6): Found tag '${tag4}'`);
-            return tag4;
-          }
-        } catch (pass4Err) {
-          logger.warn(`Pass 4 (Middle Red Channel) notice: ${pass4Err.message}`);
+          logger.warn(`Pass 3 (Inverted) notice: ${pass3Err.message}`);
         }
 
       } catch (prepErr) {
@@ -354,6 +317,19 @@ async function detectTagFromImage(imagePath) {
       pool.releaseWorker(ocrWorker);
     }
   }
+}
+
+/**
+ * Runs multi-pass targeted local OCR on a converted JPG file with a 4-second timeout limit.
+ * 
+ * @param {string} imagePath Absolute path to the local JPG image
+ * @returns {Promise<string|null>} Detected tag number or null if none found
+ */
+async function detectTagFromImage(imagePath) {
+  return Promise.race([
+    detectTagInternal(imagePath),
+    new Promise(resolve => setTimeout(() => resolve(null), 4000))
+  ]);
 }
 
 /**

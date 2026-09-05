@@ -209,12 +209,8 @@ async function processJob(job) {
     // 5. Upload file
     logger.info(`Uploading JPG to Google Drive as '${uploadFilename}'...`);
     const uploadedFile = await drive.uploadFile(uploadFilename, tempJpgPath);
-    
-    // 6. Verify upload
-    logger.info(`Verifying uploaded file exists on Drive: ID ${uploadedFile.id} ('${uploadFilename}')`);
-    const exists = await drive.checkFileExists(uploadedFile.id);
-    if (!exists) {
-      throw new Error(`Google Drive verification failed: Uploaded file ID ${uploadedFile.id} not found.`);
+    if (!uploadedFile || !uploadedFile.id) {
+      throw new Error(`Google Drive upload failed for '${uploadFilename}'.`);
     }
 
     // 7. Safe delete original
