@@ -124,6 +124,7 @@ async function convertWithSharp(inputPath, outputPath, quality) {
   if (!sharp) throw new Error('sharp module not loaded');
   await sharp(inputPath)
     .rotate() // Auto-orient based on EXIF
+    .withMetadata() // Preserve embedded ICC profile & EXIF metadata
     .jpeg({ quality: parseInt(quality, 10) || 95, mozjpeg: true, chromaSubsampling: '4:4:4' })
     .toFile(outputPath);
 }
