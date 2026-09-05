@@ -16,6 +16,7 @@ try {
   if (sharp) {
     sharp.cache(false);
     sharp.simd(true);
+    sharp.concurrency(1);
   }
 } catch (e) {
   sharp = null;

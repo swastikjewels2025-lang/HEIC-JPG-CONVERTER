@@ -7,6 +7,7 @@ try {
   if (sharp) {
     sharp.cache(false);
     sharp.simd(true);
+    sharp.concurrency(1);
   }
 } catch (e) {
   sharp = null;
@@ -124,6 +125,25 @@ const BLACKLIST = new Set([
 ]);
 
 /**
+ * Normalizes common OCR misreads and spacing variations in jewelry text.
+ */
+function normalizeOcrText(rawText) {
+  if (!rawText) return '';
+  let text = rawText.toUpperCase();
+
+  // Normalize common OCR character confusions for jewelry prefix starters (0/O/Q -> D when followed by jewelry code)
+  // e.g. 0BR334 -> DBR334, OBR334 -> DBR334, 0MS189 -> DMS189, OMS189 -> DMS189, 0NS -> DNS
+  text = text.replace(/\b[0OQ]\s*(BR|MS|NS|ER|GR|LR|PS|BN|NP|CH|NC|TK|PD|KDA|JUM)/g, 'D$1');
+
+  // Normalize separated initial D/G letters: e.g. "D BR 334" or "D.BR 334" or "D-BR" -> "DBR 334"
+  text = text.replace(/\b([DG])\s*[.\-_~,;:]*\s*(BN|BR|ER|GR|LR|MS|NP|NS|PS|CH|NC|TK|PD|KDA|JUM)/g, '$1$2');
+
+  // Replace punctuation except within text
+  text = text.replace(/[.,;:_~|/\\]+/g, ' ');
+  return text;
+}
+
+/**
  * Extracts and cleans jewelry tag numbers from recognized text.
  * Matches patterns like DER564, DBR298, DBR336, DMS189, DNS291, DLR1212, CP1148, etc.
  * 
@@ -133,32 +153,54 @@ const BLACKLIST = new Set([
 function extractTagPattern(rawText) {
   if (!rawText || typeof rawText !== 'string') return null;
 
-  const cleanText = rawText.toUpperCase().replace(/[.,;:]+/g, ' ');
-  const lines = cleanText.split(/[\r\n]+/);
+  const normalized = normalizeOcrText(rawText);
+  const lines = normalized.split(/[\r\n]+/);
 
-  // Priority 1: Match against the exact official jewelry prefixes
-  for (const prefix of JEWELRY_CATALOG_PREFIXES) {
+  // Group prefixes by length: 3+ letters first (e.g. DBR, DMS), then 2 letters (e.g. BR, MS)
+  const primaryPrefixes = JEWELRY_CATALOG_PREFIXES.filter(p => p.replace(/\s+/g, '').length >= 3);
+  const secondaryPrefixes = JEWELRY_CATALOG_PREFIXES.filter(p => p.replace(/\s+/g, '').length < 3);
+  const orderedPrefixes = [...primaryPrefixes, ...secondaryPrefixes];
+
+  for (const prefix of orderedPrefixes) {
     const cleanPrefix = prefix.replace(/\s+/g, '');
     const escapedPrefix = prefix.replace(/\s+/g, '\\s*');
-    
-    // For 2-letter prefixes (CP, CS, BN, NS, PS, LS, BR, ER, TK, BA), require 3+ digits to avoid 2-digit reflections
+
     const minDigits = cleanPrefix.length <= 2 ? 3 : 2;
-    const prefixRegex = new RegExp(`\\b${escapedPrefix}\\s*[-_]?\\s*(\\d{${minDigits},7})\\b`, 'i');
-    
+    // Allow digits with optional single spaces between them (e.g. "DBR32 8" -> "DBR328", "DBR 334" -> "DBR334")
+    const regex = new RegExp(`\\b${escapedPrefix}\\s*[-_]?\\s*(\\d(?:\\s*\\d){${minDigits - 1},7})\\b`, 'i');
+
     for (const line of lines) {
-      const match = prefixRegex.exec(line);
+      const match = regex.exec(line);
       if (match) {
-        return `${cleanPrefix}${match[1]}`;
+        const digits = match[1].replace(/\s+/g, '');
+        if (digits.length >= minDigits) {
+          return `${cleanPrefix}${digits}`;
+        }
       }
     }
 
-    // Ghost character or letter overlap between prefix and digits (e.g. DERS556 -> DER556)
+    // Ghost character handling (e.g. DERS556 -> DER556)
     if (cleanPrefix.length >= 3) {
-      const ghostRegex = new RegExp(`\\b${escapedPrefix}[S\\-_\\s]+(\\d{${minDigits},7})\\b`, 'i');
+      const ghostRegex = new RegExp(`\\b${escapedPrefix}[S\\-_\\s]+(\\d(?:\\s*\\d){${minDigits - 1},7})\\b`, 'i');
       for (const line of lines) {
         const match = ghostRegex.exec(line);
         if (match) {
-          return `${cleanPrefix}${match[1]}`;
+          const digits = match[1].replace(/\s+/g, '');
+          return `${cleanPrefix}${digits}`;
+        }
+      }
+
+      // Trailing B/S/O/I misread as digit (e.g. DBR32B -> DBR328, DBR32S -> DBR325)
+      const trailingSubstRegex = new RegExp(`\\b${escapedPrefix}\\s*[-_]?\\s*(\\d{2,5})([BSOI])\\b`, 'i');
+      for (const line of lines) {
+        const match = trailingSubstRegex.exec(line);
+        if (match) {
+          let char = match[2];
+          if (char === 'B') char = '8';
+          else if (char === 'S') char = '5';
+          else if (char === 'O') char = '0';
+          else if (char === 'I') char = '1';
+          return `${cleanPrefix}${match[1]}${char}`;
         }
       }
     }
@@ -222,7 +264,7 @@ async function detectTagFromImage(imagePath) {
       }
     }
 
-    // Pass 1: Upper-Middle 70% Crop (~900px) with PSM 6 then PSM 11
+    // Pass 1: Upper-Middle 70% Crop (~900px) with PSM 6
     // Reads digital overlays (DER564, DBR298, DMS189, DNS291, DGR10286, DGR10282) in ~0.15s
     try {
       let pass1Input = imageBuffer;
@@ -247,22 +289,16 @@ async function detectTagFromImage(imagePath) {
         logger.info(`OCR Tag Match (Pass 1 - Upper PSM 6): Found tag '${tagPsm6}'`);
         return tagPsm6;
       }
-
-      await ocrWorker.setParameters({ tessedit_pageseg_mode: '11' });
-      const { data: { text: textPsm11 } } = await ocrWorker.recognize(pass1Input);
-      const tagPsm11 = extractTagPattern(textPsm11);
-      if (tagPsm11) {
-        logger.info(`OCR Tag Match (Pass 1 - Upper PSM 11): Found tag '${tagPsm11}'`);
-        return tagPsm11;
-      }
     } catch (pass1Err) {
       logger.warn(`Pass 1 (Upper Focus) notice: ${pass1Err.message}`);
     }
 
     if (sharp && metadata) {
       try {
+        await new Promise(r => setImmediate(r));
+
         // Pass 2: Center-Middle Band (10% to 75%) Brightness Thresholding
-        // Thresholding at 150 strips green velvet & cushion fabric leaving pure white text (e.g. DBR336)
+        // Thresholding at 145 strips green velvet & cushion fabric leaving pure white text (e.g. DBR336)
         try {
           const threshBuf = await sharp(imageBuffer)
             .extract({
@@ -273,36 +309,29 @@ async function detectTagFromImage(imagePath) {
             })
             .resize({ width: 900, withoutEnlargement: true })
             .grayscale()
-            .threshold(150)
+            .threshold(145)
             .toBuffer();
 
-          await ocrWorker.setParameters({ tessedit_pageseg_mode: '6' });
           const { data: { text: thText6 } } = await ocrWorker.recognize(threshBuf);
           const tagTh6 = extractTagPattern(thText6);
           if (tagTh6) {
             logger.info(`OCR Tag Match (Pass 2 - Threshold PSM 6): Found tag '${tagTh6}'`);
             return tagTh6;
           }
-
-          await ocrWorker.setParameters({ tessedit_pageseg_mode: '11' });
-          const { data: { text: thText11 } } = await ocrWorker.recognize(threshBuf);
-          const tagTh11 = extractTagPattern(thText11);
-          if (tagTh11) {
-            logger.info(`OCR Tag Match (Pass 2 - Threshold PSM 11): Found tag '${tagTh11}'`);
-            return tagTh11;
-          }
         } catch (pass2Err) {
           logger.warn(`Pass 2 (Threshold) notice: ${pass2Err.message}`);
         }
 
-        // Pass 3: Inverted & Normalized (Cards, rings, dark tags)
+        await new Promise(r => setImmediate(r));
+
+        // Pass 3: Inverted & Normalized (Cards, rings, dark tags, fan ornaments)
         try {
           const topBuffer = await sharp(imageBuffer)
             .extract({
               left: 0,
-              top: Math.floor(height * 0.08),
+              top: Math.floor(height * 0.05),
               width: width,
-              height: Math.floor(height * 0.50)
+              height: Math.floor(height * 0.55)
             })
             .resize({ width: 900, withoutEnlargement: true })
             .grayscale()

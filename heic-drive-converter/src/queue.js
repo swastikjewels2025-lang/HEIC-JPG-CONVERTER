@@ -268,7 +268,8 @@ async function processQueue() {
       await processJob(job);
     } finally {
       activeConversions--;
-      // Run loop again to fetch next job
+      // Small 100ms yield to keep CPU load balanced during large batch backlogs
+      await new Promise(r => setTimeout(r, 100));
       processQueue().catch(err => logger.error('Error in next queue step: ', err));
     }
   } catch (err) {
