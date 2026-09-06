@@ -1,6 +1,7 @@
 const path = require('path');
 const fs = require('fs');
 const { createWorker } = require('tesseract.js');
+const config = require('./config');
 const logger = require('./logger');
 
 let sharp;
@@ -14,6 +15,8 @@ try {
 } catch (e) {
   sharp = null;
 }
+
+const OCR_TARGET_WIDTH = 1200;
 
 /**
  * Worker pool to allow concurrent OCR recognition without blocking the entire queue.
@@ -44,14 +47,15 @@ class OcrWorkerPool {
           createPromises.push((async () => {
             const w = await createWorker('eng', 1, workerOptions);
             await w.setParameters({
-              tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -_.'
+              tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -_.',
+              user_defined_dpi: '150'
             });
             return w;
           })());
         }
         this.allWorkers = await Promise.all(createPromises);
         this.availableWorkers = [...this.allWorkers];
-        logger.info(`OCR Worker Pool initialized with ${this.allWorkers.length} parallel workers (Offline Local Mode).`);
+        logger.info(`OCR Worker Pool initialized with ${this.allWorkers.length} parallel workers (Offline Local Mode, DPI 150).`);
       } catch (err) {
         logger.error(`Failed to initialize OCR Worker Pool: ${err.message}`);
       } finally {
@@ -102,7 +106,8 @@ class OcrWorkerPool {
   }
 }
 
-const pool = new OcrWorkerPool(1);
+const OCR_POOL_SIZE = Math.max(1, Math.min(config.maxConcurrentConversions || 2, 4));
+const pool = new OcrWorkerPool(OCR_POOL_SIZE);
 
 /**
  * Complete list of official catalog categories and jewelry prefixes.
@@ -238,12 +243,14 @@ function extractTagPattern(rawText) {
  */
 async function detectTagFromImage(imagePath) {
   let ocrWorker = null;
+  let imageBuffer = null;
+  let sharedGrayBuf = null;
+
   try {
     ocrWorker = await pool.acquireWorker();
     if (!ocrWorker) return null;
 
     // Read image into memory buffer once to prevent any race condition with temporary file deletion
-    let imageBuffer;
     try {
       imageBuffer = await fs.promises.readFile(imagePath);
     } catch (readErr) {
@@ -277,7 +284,7 @@ async function detectTagFromImage(imagePath) {
 
         const cushionCropBuf = await sharp(imageBuffer)
           .extract({ left: cropLeft, top: cropTop, width: cropWidth, height: cropHeight })
-          .resize({ width: 1800, withoutEnlargement: true })
+          .resize({ width: OCR_TARGET_WIDTH, withoutEnlargement: true })
           .grayscale()
           .threshold(175)
           .negate() // Black text on white background
@@ -295,13 +302,30 @@ async function detectTagFromImage(imagePath) {
       }
     }
 
-    // Pass 2: Full-Frame High-Res (width ~1800px) with PSM 11 and fallback to PSM 6
+    // Create single shared grayscale & resized intermediate buffer for Passes 2, 3, and 4
+    if (sharp && metadata) {
+      try {
+        sharedGrayBuf = await sharp(imageBuffer)
+          .resize({ width: OCR_TARGET_WIDTH, withoutEnlargement: true })
+          .grayscale()
+          .toBuffer();
+      } catch (sharedErr) {
+        logger.warn(`Shared grayscale OCR buffer notice: ${sharedErr.message}`);
+        sharedGrayBuf = null;
+      }
+    }
+
+    // Pass 2: Full-Frame High-Res (width 1200px) with PSM 11 and fallback to PSM 6
     // Handles white label tags, barcode stickers, and overlays anywhere in the image
     try {
-      let pass2Input = imageBuffer;
-      if (sharp && metadata) {
+      let pass2Input = sharedGrayBuf || imageBuffer;
+      if (sharp && sharedGrayBuf) {
+        pass2Input = await sharp(sharedGrayBuf)
+          .normalise()
+          .toBuffer();
+      } else if (sharp && metadata) {
         pass2Input = await sharp(imageBuffer)
-          .resize({ width: 1800, withoutEnlargement: true })
+          .resize({ width: OCR_TARGET_WIDTH, withoutEnlargement: true })
           .grayscale()
           .normalise()
           .toBuffer();
@@ -332,12 +356,20 @@ async function detectTagFromImage(imagePath) {
     if (sharp && metadata) {
       try {
         await new Promise(r => setImmediate(r));
-        const thresh165Buf = await sharp(imageBuffer)
-          .resize({ width: 1800, withoutEnlargement: true })
-          .grayscale()
-          .threshold(165)
-          .negate()
-          .toBuffer();
+        let thresh165Buf;
+        if (sharedGrayBuf) {
+          thresh165Buf = await sharp(sharedGrayBuf)
+            .threshold(165)
+            .negate()
+            .toBuffer();
+        } else {
+          thresh165Buf = await sharp(imageBuffer)
+            .resize({ width: OCR_TARGET_WIDTH, withoutEnlargement: true })
+            .grayscale()
+            .threshold(165)
+            .negate()
+            .toBuffer();
+        }
 
         await ocrWorker.setParameters({ tessedit_pageseg_mode: '11' });
         const { data: { text: th165Text } } = await ocrWorker.recognize(thresh165Buf);
@@ -349,12 +381,20 @@ async function detectTagFromImage(imagePath) {
 
         // Pass 4: Full-Frame Medium-Threshold Binary Inversion (threshold 125)
         // For lighter/medium cushions (DBR336, DBR298)
-        const thresh125Buf = await sharp(imageBuffer)
-          .resize({ width: 1800, withoutEnlargement: true })
-          .grayscale()
-          .threshold(125)
-          .negate()
-          .toBuffer();
+        let thresh125Buf;
+        if (sharedGrayBuf) {
+          thresh125Buf = await sharp(sharedGrayBuf)
+            .threshold(125)
+            .negate()
+            .toBuffer();
+        } else {
+          thresh125Buf = await sharp(imageBuffer)
+            .resize({ width: OCR_TARGET_WIDTH, withoutEnlargement: true })
+            .grayscale()
+            .threshold(125)
+            .negate()
+            .toBuffer();
+        }
 
         const { data: { text: th125Text } } = await ocrWorker.recognize(thresh125Buf);
         const tag125 = extractTagPattern(th125Text);
@@ -372,6 +412,7 @@ async function detectTagFromImage(imagePath) {
     logger.warn(`OCR text detection failed on ${imagePath}: ${err.message}`);
     return null;
   } finally {
+    sharedGrayBuf = null;
     imageBuffer = null;
     if (ocrWorker) {
       pool.releaseWorker(ocrWorker);
