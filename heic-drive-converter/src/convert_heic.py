@@ -35,8 +35,14 @@ def convert_heic_to_jpg(input_path, output_path, quality=95):
             except Exception:
                 pass
 
-        # Normalize color channels to standard sRGB
-        if image.mode != "RGB":
+        # Normalize color channels to standard sRGB (handling transparency with clean white background)
+        if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+            background = Image.new("RGB", image.size, (255, 255, 255))
+            if image.mode == "P":
+                image = image.convert("RGBA")
+            background.paste(image, mask=image.split()[-1])
+            image = background
+        elif image.mode != "RGB":
             image = image.convert("RGB")
 
         # Save JPEG with 4:4:4 subsampling (subsampling=0) and high quality

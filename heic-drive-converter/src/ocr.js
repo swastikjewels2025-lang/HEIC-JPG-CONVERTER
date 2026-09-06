@@ -1,3 +1,5 @@
+const path = require('path');
+const fs = require('fs');
 const { createWorker } = require('tesseract.js');
 const logger = require('./logger');
 
@@ -32,10 +34,15 @@ class OcrWorkerPool {
 
     this.initPromise = (async () => {
       try {
+        const localLangDir = path.resolve(__dirname, '..');
+        const workerOptions = fs.existsSync(path.join(localLangDir, 'eng.traineddata'))
+          ? { langPath: localLangDir, gzip: false }
+          : {};
+
         const createPromises = [];
         for (let i = 0; i < this.poolSize; i++) {
           createPromises.push((async () => {
-            const w = await createWorker('eng');
+            const w = await createWorker('eng', 1, workerOptions);
             await w.setParameters({
               tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -_.'
             });
@@ -44,7 +51,7 @@ class OcrWorkerPool {
         }
         this.allWorkers = await Promise.all(createPromises);
         this.availableWorkers = [...this.allWorkers];
-        logger.info(`OCR Worker Pool initialized with ${this.allWorkers.length} parallel workers.`);
+        logger.info(`OCR Worker Pool initialized with ${this.allWorkers.length} parallel workers (Offline Local Mode).`);
       } catch (err) {
         logger.error(`Failed to initialize OCR Worker Pool: ${err.message}`);
       } finally {
@@ -222,8 +229,6 @@ function extractTagPattern(rawText) {
 
   return null;
 }
-
-const fs = require('fs');
 
 /**
  * Runs multi-pass targeted local OCR on a converted JPG file to detect jewelry catalog tag numbers.

@@ -199,19 +199,19 @@ async function processJob(job) {
       throw new Error('Local JPG validation checks failed. Image may be corrupted.');
     }
 
-    // 4. Analyze image via Local OCR for Tag Number (DGR10278, DPS3637, DLR2728, etc.)
+    // 4. Analyze image via Local OCR to detect jewelry tag number (DBR330, DBR334, DER567, PS1554, etc.)
     let uploadFilename = job.target_filename;
     try {
       logger.info(`Scanning image for jewelry tag number via local OCR...`);
       const detectedTag = await ocr.detectTagFromImage(tempJpgPath);
       if (detectedTag) {
         uploadFilename = await drive.getUniqueFilenameInFolder(detectedTag, '.jpg');
-        logger.info(`Auto-Renamed: Tag '${detectedTag}' detected! Target upload filename: '${uploadFilename}'`);
+        logger.info(`Auto-Renamed: Tag '${detectedTag}' detected from image! Output filename: '${uploadFilename}'`);
       } else {
-        logger.info(`No specific tag detected in image. Using default filename: '${uploadFilename}'`);
+        logger.info(`No specific tag detected in image. Using fallback filename: '${uploadFilename}'`);
       }
     } catch (ocrErr) {
-      logger.warn(`OCR tag scan skipped: ${ocrErr.message}. Using default name: '${uploadFilename}'`);
+      logger.warn(`OCR tag scan notice: ${ocrErr.message}. Using fallback filename: '${uploadFilename}'`);
     }
 
     // 5. Upload file
