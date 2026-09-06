@@ -69,7 +69,7 @@ async function claimNextPendingJob() {
 /**
  * Updates a job status in the SQLite database.
  */
-async function updateJobStatus(fileId, status, errorMsg = null) {
+async function updateJobStatus(fileId, status, targetFilename = null) {
   const now = Date.now();
   let sql = '';
   let params = [];
@@ -84,10 +84,10 @@ async function updateJobStatus(fileId, status, errorMsg = null) {
   } else if (status === 'COMPLETED') {
     sql = `
       UPDATE conversion_queue 
-      SET status = ?, completed_at = ?, updated_at = ?
+      SET status = ?, target_filename = COALESCE(?, target_filename), completed_at = ?, updated_at = ?
       WHERE file_id = ?
     `;
-    params = [status, now, now, fileId];
+    params = [status, targetFilename, now, now, fileId];
   } else if (status === 'SKIPPED') {
     sql = `
       UPDATE conversion_queue 
@@ -192,20 +192,22 @@ async function processJob(job) {
     logger.info(`Converting HEIC file locally...`);
     await converter.convertHeicToJpg(tempHeicPath, tempJpgPath);
 
-    // 3. Validate file
-    logger.info(`Validating converted JPG file...`);
-    const isValid = validator.validateJpg(tempJpgPath);
+    // 3. Pre-upload Quality & Integrity Verification
+    logger.info(`Running pre-upload quality & integrity verification...`);
+    const isValid = await validator.validateJpg(tempJpgPath);
     if (!isValid) {
-      throw new Error('Local JPG validation checks failed. Image may be corrupted.');
+      throw new Error('Local JPG validation checks failed. Converted image may be empty or corrupted.');
     }
 
     // 4. Analyze image via Local OCR to detect jewelry tag number (DBR330, DBR334, DER567, PS1554, etc.)
     let uploadFilename = job.target_filename;
+    let renameType = 'ORIGINAL_NAME';
     try {
       logger.info(`Scanning image for jewelry tag number via local OCR...`);
       const detectedTag = await ocr.detectTagFromImage(tempJpgPath);
       if (detectedTag) {
         uploadFilename = await drive.getUniqueFilenameInFolder(detectedTag, '.jpg');
+        renameType = 'TAG_OCR';
         logger.info(`Auto-Renamed: Tag '${detectedTag}' detected from image! Output filename: '${uploadFilename}'`);
       } else {
         logger.info(`No specific tag detected in image. Using fallback filename: '${uploadFilename}'`);
@@ -221,7 +223,15 @@ async function processJob(job) {
       throw new Error(`Google Drive upload failed for '${uploadFilename}'.`);
     }
 
-    // 7. Safe delete original
+    // 6. Post-Upload Verification on Google Drive (Confirm file exists and is active)
+    logger.info(`Running post-upload verification on Google Drive for '${uploadFilename}' (ID: ${uploadedFile.id})...`);
+    const driveVerified = await drive.checkFileExists(uploadedFile.id);
+    if (!driveVerified) {
+      throw new Error(`Post-upload verification failed: Uploaded file ID ${uploadedFile.id} not verified on Drive.`);
+    }
+    logger.info(`Post-upload verification PASSED: '${uploadFilename}' verified active and healthy on Google Drive.`);
+
+    // 7. Safe delete original HEIC (ONLY after 100% verified upload)
     if (config.testMode) {
       logger.info(`[TEST MODE] Skipping trashing of original file: ${job.filename}`);
     } else {
@@ -229,9 +239,9 @@ async function processJob(job) {
       await drive.trashFile(job.file_id);
     }
 
-    // 8. Complete job
-    await updateJobStatus(job.file_id, 'COMPLETED');
-    logger.info(`Successfully completed job for ${job.filename} -> ${uploadFilename}`);
+    // 8. Complete job with final verified filename in SQLite
+    await updateJobStatus(job.file_id, 'COMPLETED', uploadFilename);
+    logger.info(`Successfully completed & verified job for ${job.filename} -> ${uploadFilename} [${renameType}]`);
 
   } catch (err) {
     logger.error(`Error processing job for ${job.filename}: `, err);

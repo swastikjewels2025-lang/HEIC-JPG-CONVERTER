@@ -265,18 +265,12 @@ async function detectTagFromImage(imagePath) {
       }
     }
 
-    // Pass 1: Upper 75% High-Res Crop (width ~1800px) with PSM 11 (Sparse Text / Overlays)
-    // Retains character height so small text like DER567, DER556, DBR328 is sharp and easily readable
+    // Pass 1: Full-Frame High-Res (width ~1800px) with PSM 11 (Sparse Text / Overlays)
+    // Scans entire image (top, middle, and bottom) so tags like DBR335 at the bottom are never cut off
     try {
       let pass1Input = imageBuffer;
       if (sharp && metadata) {
         pass1Input = await sharp(imageBuffer)
-          .extract({
-            left: 0,
-            top: 0,
-            width: width,
-            height: Math.floor(height * 0.75)
-          })
           .resize({ width: 1800, withoutEnlargement: true })
           .grayscale()
           .normalise()
@@ -287,7 +281,7 @@ async function detectTagFromImage(imagePath) {
       const { data: { text: textPsm11 } } = await ocrWorker.recognize(pass1Input);
       const tagPsm11 = extractTagPattern(textPsm11);
       if (tagPsm11) {
-        logger.info(`OCR Tag Match (Pass 1 - Upper High-Res PSM 11): Found tag '${tagPsm11}'`);
+        logger.info(`OCR Tag Match (Pass 1 - Full-Frame PSM 11): Found tag '${tagPsm11}'`);
         return tagPsm11;
       }
 
@@ -296,27 +290,21 @@ async function detectTagFromImage(imagePath) {
       const { data: { text: textPsm6 } } = await ocrWorker.recognize(pass1Input);
       const tagPsm6 = extractTagPattern(textPsm6);
       if (tagPsm6) {
-        logger.info(`OCR Tag Match (Pass 1 - Upper High-Res PSM 6): Found tag '${tagPsm6}'`);
+        logger.info(`OCR Tag Match (Pass 1 - Full-Frame PSM 6): Found tag '${tagPsm6}'`);
         return tagPsm6;
       }
     } catch (pass1Err) {
-      logger.warn(`Pass 1 (Upper Focus) notice: ${pass1Err.message}`);
+      logger.warn(`Pass 1 (Full Frame) notice: ${pass1Err.message}`);
     }
 
     if (sharp && metadata) {
       try {
         await new Promise(r => setImmediate(r));
 
-        // Pass 2: Velvet Cushion / Dark Background Thresholding (10% to 75% band)
+        // Pass 2: Full-Frame Velvet Cushion / Dark Background Thresholding
         // High-contrast binary mask isolates pure white text on green cushions (DBR328, DBR340) and black gloves
         try {
           const threshBuf = await sharp(imageBuffer)
-            .extract({
-              left: 0,
-              top: Math.floor(height * 0.05),
-              width: width,
-              height: Math.floor(height * 0.70)
-            })
             .resize({ width: 1800, withoutEnlargement: true })
             .grayscale()
             .threshold(135)
