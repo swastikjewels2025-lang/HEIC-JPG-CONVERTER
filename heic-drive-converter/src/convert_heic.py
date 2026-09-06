@@ -22,18 +22,25 @@ def convert_heic_to_jpg(input_path, output_path, quality=95):
         except Exception:
             pass
 
-        # Preserve vibrant colors: convert Apple Display P3 / Wide Gamut ICC profile to standard sRGB
+        # Standard Universal sRGB Color Pipeline (Option A):
+        # 1. Transform pixels from source color gamut (e.g. Apple Display P3) to sRGB
+        # 2. Embed the verified sRGB ICC profile in the output JPEG (never attaching source P3 metadata to sRGB pixels)
+        srgb_profile = ImageCms.createProfile("sRGB")
+        srgb_profile_bytes = ImageCms.ImageCmsProfile(srgb_profile).tobytes()
+
         icc_profile = image.info.get("icc_profile")
         if icc_profile:
             try:
                 input_profile = ImageCms.getOpenProfile(io.BytesIO(icc_profile))
-                srgb_profile = ImageCms.createProfile("sRGB")
                 transformed = ImageCms.profileToProfile(image, input_profile, srgb_profile, outputMode="RGB")
                 if transformed is not None:
                     transformed.info = image.info.copy()
                     image = transformed
             except Exception:
                 pass
+
+        # Update metadata to sRGB profile
+        image.info["icc_profile"] = srgb_profile_bytes
 
         # Normalize color channels to standard sRGB (handling transparency with clean white background)
         if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
@@ -45,10 +52,11 @@ def convert_heic_to_jpg(input_path, output_path, quality=95):
         elif image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Save JPEG with 4:4:4 subsampling (subsampling=0) and high quality
+        # Save JPEG with 4:4:4 subsampling (subsampling=0), high quality, and embedded sRGB profile
         save_kwargs = {
             "quality": int(quality),
             "subsampling": 0,
+            "icc_profile": srgb_profile_bytes,
         }
 
         if "exif" in image.info and image.info["exif"]:

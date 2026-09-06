@@ -210,7 +210,7 @@ async function processJob(job) {
         renameType = 'TAG_OCR';
         logger.info(`Auto-Renamed: Tag '${detectedTag}' detected from image! Output filename: '${uploadFilename}'`);
       } else {
-        logger.info(`No specific tag detected in image. Using fallback filename: '${uploadFilename}'`);
+        logger.warn(`[OCR Notice] No specific jewelry tag detected in image '${job.filename}'. Using fallback filename: '${uploadFilename}'`);
       }
     } catch (ocrErr) {
       logger.warn(`OCR tag scan notice: ${ocrErr.message}. Using fallback filename: '${uploadFilename}'`);
@@ -252,38 +252,56 @@ async function processJob(job) {
 }
 
 /**
- * Throttled queue loops. Pulls pending items and runs them concurrently up to limits.
+ * Throttled queue loops. Pulls pending items and runs them continuously up to concurrency limits.
  */
+async function workerLoop() {
+  while (!isGracefulShutdown) {
+    const job = await claimNextPendingJob();
+    if (!job) {
+      // Check if there are truly no pending jobs or if it was just a transient contention collision
+      const now = Date.now();
+      const countRow = await db.get(
+        "SELECT COUNT(*) as count FROM conversion_queue WHERE status = 'PENDING' OR (status = 'RETRY_WAIT' AND next_retry_at <= ?)",
+        [now]
+      );
+      if (countRow && countRow.count > 0 && !isGracefulShutdown) {
+        // Jobs still exist in queue; yield briefly to resolve lock contention before claiming next
+        await new Promise(r => setTimeout(r, 50));
+        continue;
+      }
+      // No remaining pending jobs in database; exit this worker loop cleanly
+      break;
+    }
+
+    try {
+      await processJob(job);
+    } catch (err) {
+      logger.error('Error during job processing: ', err);
+    }
+
+    // Small 50ms yield between consecutive items to keep event loop balanced
+    await new Promise(r => setTimeout(r, 50));
+  }
+}
+
 async function processQueue() {
   if (isGracefulShutdown) {
     logger.info('Queue processing paused due to graceful shutdown.');
     return;
   }
 
-  if (activeConversions >= config.maxConcurrentConversions) {
-    return; // Concurrency limit reached
-  }
-
-  try {
-    const job = await claimNextPendingJob();
-    if (!job) {
-      return; // No pending or retry-ready jobs
-    }
-
+  // Launch persistent worker loops up to the configured concurrency limit
+  while (activeConversions < config.maxConcurrentConversions && !isGracefulShutdown) {
     activeConversions++;
-    // Trigger queue processor again for other concurrent slots
-    processQueue().catch(err => logger.error('Error in concurrent queue slot: ', err));
-
-    try {
-      await processJob(job);
-    } finally {
-      activeConversions--;
-      // Small 100ms yield to keep CPU load balanced during large batch backlogs
-      await new Promise(r => setTimeout(r, 100));
-      processQueue().catch(err => logger.error('Error in next queue step: ', err));
-    }
-  } catch (err) {
-    logger.error('Error occurred in queue loop: ', err);
+    (async () => {
+      try {
+        await workerLoop();
+      } catch (err) {
+        logger.error('Error in persistent worker loop: ', err);
+      } finally {
+        activeConversions--;
+      }
+    })();
   }
 }
 
