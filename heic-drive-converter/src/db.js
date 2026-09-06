@@ -71,6 +71,13 @@ async function init() {
     )
   `;
   await run(sql);
+
+  // Auto-recover any orphaned jobs that were left in PROCESSING state during a crash/restart
+  const recoverResult = await run("UPDATE conversion_queue SET status = 'PENDING' WHERE status = 'PROCESSING'");
+  if (recoverResult && recoverResult.changes > 0) {
+    logger.info(`Auto-recovered ${recoverResult.changes} orphaned PROCESSING jobs back to PENDING.`);
+  }
+
   logger.info('Database schema and WAL PRAGMAs verified/initialized successfully.');
 }
 
