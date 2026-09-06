@@ -156,8 +156,9 @@ function normalizeOcrText(rawText) {
 }
 
 /**
- * Extracts and cleans jewelry tag numbers from recognized text.
- * Matches patterns like DER564, DBR298, DBR336, DMS189, DNS291, DLR1212, CP1148, etc.
+ * Extracts and cleans jewelry tag numbers from recognized text using candidate scoring
+ * and space-tolerant digit concatenation.
+ * Matches patterns like DER564, DER552 (from "DER 55 2"), DBR336, DMS189, DNS291, DGR10278, CP1148, etc.
  * 
  * @param {string} rawText Raw OCR output
  * @returns {string|null} Normalized tag code or null
@@ -173,33 +174,77 @@ function extractTagPattern(rawText) {
   const secondaryPrefixes = JEWELRY_CATALOG_PREFIXES.filter(p => p.replace(/\s+/g, '').length < 3);
   const orderedPrefixes = [...primaryPrefixes, ...secondaryPrefixes];
 
+  const candidates = [];
+
   for (const prefix of orderedPrefixes) {
     const cleanPrefix = prefix.replace(/\s+/g, '');
     const escapedPrefix = prefix.replace(/\s+/g, '\\s*');
-
     const minDigits = cleanPrefix.length <= 2 ? 3 : 2;
-    // Match prefix followed by contiguous digits (prevents merging stray background numbers like "PS1554 8" -> "PS1554")
-    const regex = new RegExp(`\\b${escapedPrefix}\\s*[-_]?\\s*(\\d{${minDigits},6})\\b`, 'i');
 
+    // Pattern 1: Split digits (e.g. "DER 55 2", "DER 46 1", "DER 55-4", "DGR 102 78")
+    // Captures prefix followed by two digit groups separated by single space/dash/dot
+    const splitRegex = new RegExp(`\\b${escapedPrefix}\\s*[-_.]?\\s*(\\d{1,4})[\\s-_.]+(\\d{1,3})\\b`, 'i');
     for (const line of lines) {
-      const match = regex.exec(line);
+      const match = splitRegex.exec(line);
       if (match) {
-        return `${cleanPrefix}${match[1]}`;
+        // If the first group already has 4+ digits and the second is a single digit (e.g. "PS1554 8"),
+        // the trailing digit is likely weight or quantity, so we preserve the 4-digit code.
+        if (match[1].length >= 4 && match[2].length === 1) {
+          candidates.push({
+            tag: `${cleanPrefix}${match[1]}`,
+            digits: match[1],
+            length: match[1].length,
+            score: 90 + match[1].length
+          });
+        } else {
+          const combined = `${match[1]}${match[2]}`;
+          if (combined.length >= minDigits && combined.length <= 6) {
+            candidates.push({
+              tag: `${cleanPrefix}${combined}`,
+              digits: combined,
+              length: combined.length,
+              // Favor 3-5 digit catalog tags with higher score
+              score: (combined.length >= 3 && combined.length <= 5 ? 110 : 70) + combined.length
+            });
+          }
+        }
       }
     }
 
-    // Ghost character handling (e.g. DERS556 -> DER556)
+    // Pattern 2: Contiguous digits (e.g. "DER552", "DBR334", "CP1148")
+    const contiguousRegex = new RegExp(`\\b${escapedPrefix}\\s*[-_.]?\\s*(\\d{${minDigits},6})\\b`, 'i');
+    for (const line of lines) {
+      const match = contiguousRegex.exec(line);
+      if (match) {
+        const digits = match[1];
+        candidates.push({
+          tag: `${cleanPrefix}${digits}`,
+          digits: digits,
+          length: digits.length,
+          // Boost 3-5 digit codes over 2-digit codes to prevent truncation
+          score: (digits.length >= 3 && digits.length <= 5 ? 100 : 60) + digits.length
+        });
+      }
+    }
+
+    // Pattern 3: Ghost character handling (e.g. "DERS556" -> "DER556")
     if (cleanPrefix.length >= 3) {
       const ghostRegex = new RegExp(`\\b${escapedPrefix}[S\\-_\\s]+(\\d{${minDigits},6})\\b`, 'i');
       for (const line of lines) {
         const match = ghostRegex.exec(line);
         if (match) {
-          return `${cleanPrefix}${match[1]}`;
+          const digits = match[1];
+          candidates.push({
+            tag: `${cleanPrefix}${digits}`,
+            digits: digits,
+            length: digits.length,
+            score: (digits.length >= 3 ? 90 : 50) + digits.length
+          });
         }
       }
 
-      // Trailing B/S/O/I misread as digit (e.g. DBR32B -> DBR328, DBR32S -> DBR325)
-      const trailingSubstRegex = new RegExp(`\\b${escapedPrefix}\\s*[-_]?\\s*(\\d{2,5})([BSOI])\\b`, 'i');
+      // Pattern 4: Trailing B/S/O/I misread as digit (e.g. "DBR32B" -> "DBR328")
+      const trailingSubstRegex = new RegExp(`\\b${escapedPrefix}\\s*[-_.]?\\s*(\\d{2,5})([BSOI])\\b`, 'i');
       for (const line of lines) {
         const match = trailingSubstRegex.exec(line);
         if (match) {
@@ -208,31 +253,54 @@ function extractTagPattern(rawText) {
           else if (char === 'S') char = '5';
           else if (char === 'O') char = '0';
           else if (char === 'I') char = '1';
-          return `${cleanPrefix}${match[1]}${char}`;
+          const digits = `${match[1]}${char}`;
+          candidates.push({
+            tag: `${cleanPrefix}${digits}`,
+            digits: digits,
+            length: digits.length,
+            score: (digits.length >= 3 ? 85 : 45) + digits.length
+          });
         }
       }
     }
   }
 
   // Priority 2: General jewelry catalog prefix matching
-  const generalRegex = /\b([A-Z]{3,5})\s*[-_]?\s*(\d{2,6})\b/;
-  for (const line of lines) {
-    const match = generalRegex.exec(line);
-    if (match) {
-      const candidatePrefix = match[1];
-      const digits = match[2];
-      if (!BLACKLIST.has(candidatePrefix)) {
-        for (const known of JEWELRY_CATALOG_PREFIXES) {
-          const cleanKnown = known.replace(/\s+/g, '');
-          if (cleanKnown.length >= 3 && candidatePrefix.startsWith(cleanKnown)) {
-            return `${cleanKnown}${digits}`;
+  if (candidates.length === 0) {
+    const generalRegex = /\b([A-Z]{3,5})\s*[-_]?\s*(\d{2,6})\b/;
+    for (const line of lines) {
+      const match = generalRegex.exec(line);
+      if (match) {
+        const candidatePrefix = match[1];
+        const digits = match[2];
+        if (!BLACKLIST.has(candidatePrefix)) {
+          for (const known of JEWELRY_CATALOG_PREFIXES) {
+            const cleanKnown = known.replace(/\s+/g, '');
+            if (cleanKnown.length >= 3 && candidatePrefix.startsWith(cleanKnown)) {
+              candidates.push({
+                tag: `${cleanKnown}${digits}`,
+                digits: digits,
+                length: digits.length,
+                score: 50 + digits.length
+              });
+            }
           }
         }
       }
     }
   }
 
-  return null;
+  if (candidates.length === 0) return null;
+
+  // Candidate Ranking:
+  // 1. Highest score first (favors 3-5 digit catalog tags and split-digit reconciliations)
+  // 2. Longer digit length breaks ties (prevents 2-digit truncated tags from winning over 3-digit tags)
+  candidates.sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    return b.length - a.length;
+  });
+
+  return candidates[0].tag;
 }
 
 /**

@@ -24,6 +24,47 @@ function getBackoffMs(attempts) {
 }
 
 /**
+ * Pre-upload Tag Sanity Guard (Option 2).
+ * Verifies that a detected tag meets catalog and jewelry sanity criteria before renaming/upload.
+ * Prevents truncated or malformed tags (e.g. DER5, DER46 on 3-digit tag items) from corrupting Drive filenames.
+ *
+ * @param {string} tag - The detected tag string (e.g. "DER552", "DBR336", "CP1148")
+ * @returns {{ valid: boolean, reason?: string, prefix?: string, digits?: string }}
+ */
+function verifyTagSanity(tag) {
+  if (!tag || typeof tag !== 'string') {
+    return { valid: false, reason: 'Empty or invalid tag string' };
+  }
+
+  const cleanTag = tag.trim().toUpperCase();
+  const match = cleanTag.match(/^([A-Z\s]+)(\d+)$/);
+  if (!match) {
+    return { valid: false, reason: `Tag '${cleanTag}' does not match expected prefix+digits format` };
+  }
+
+  const prefix = match[1].replace(/\s+/g, '');
+  const digits = match[2];
+
+  // Check known catalog prefixes
+  const isKnown = ocr.JEWELRY_CATALOG_PREFIXES.some(p => p.replace(/\s+/g, '') === prefix);
+  if (!isKnown) {
+    return { valid: false, reason: `Prefix '${prefix}' is not in catalog prefixes list` };
+  }
+
+  // 2-letter prefixes require >= 3 digits to avoid false-positive reflections
+  if (prefix.length <= 2 && digits.length < 3) {
+    return { valid: false, reason: `2-letter prefix '${prefix}' requires >= 3 digits (got ${digits.length})` };
+  }
+
+  // 3+ letter prefixes require >= 2 digits
+  if (prefix.length >= 3 && digits.length < 2) {
+    return { valid: false, reason: `Prefix '${prefix}' requires >= 2 digits (got ${digits.length})` };
+  }
+
+  return { valid: true, prefix, digits };
+}
+
+/**
  * Adds a candidate file to the persistent SQLite queue.
  */
 async function addToQueue(fileId, filename, ext, mimeType, targetFilename) {
@@ -206,9 +247,14 @@ async function processJob(job) {
       logger.info(`Scanning image for jewelry tag number via local OCR...`);
       const detectedTag = await ocr.detectTagFromImage(tempJpgPath);
       if (detectedTag) {
-        uploadFilename = await drive.getUniqueFilenameInFolder(detectedTag, '.jpg');
-        renameType = 'TAG_OCR';
-        logger.info(`Auto-Renamed: Tag '${detectedTag}' detected from image! Output filename: '${uploadFilename}'`);
+        const sanity = verifyTagSanity(detectedTag);
+        if (sanity.valid) {
+          uploadFilename = await drive.getUniqueFilenameInFolder(detectedTag, '.jpg');
+          renameType = 'TAG_OCR';
+          logger.info(`Auto-Renamed: Tag '${detectedTag}' detected from image! Output filename: '${uploadFilename}'`);
+        } else {
+          logger.warn(`[OCR Sanity Check Rejected] Detected tag '${detectedTag}' failed sanity check: ${sanity.reason}. Falling back to original filename: '${uploadFilename}'`);
+        }
       } else {
         logger.warn(`[OCR Notice] No specific jewelry tag detected in image '${job.filename}'. Using fallback filename: '${uploadFilename}'`);
       }
@@ -319,5 +365,6 @@ module.exports = {
   processQueue,
   shutdown,
   cleanupOrphanedTempFiles,
-  getActiveCount
+  getActiveCount,
+  verifyTagSanity
 };
