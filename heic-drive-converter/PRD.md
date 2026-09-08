@@ -296,3 +296,36 @@ The following metrics represent actual measured performance on production-grade 
 4. **Folder Reorganization**: The service does not create subfolders or move files between different Drive folders; it writes JPGs back into the same monitored folder.
 5. **Interactive User Approval**: Queue processing and OCR renaming operate 100% autonomously without human prompt requirements.
 6. **External OCR Cloud APIs**: Does not call Google Cloud Vision, AWS Rekognition, or OpenAI APIs for OCR. All OCR is 100% local and offline.
+
+---
+
+## 8. Folder-Level Converted Image Verification System
+
+### 8.1 Purpose & Scope
+The **Folder-Level Converted Image Verification System** (`src/verifier.js`, command `npm run verify:folder`) independently audits already converted JPG files in the monitored Google Drive folder. It verifies:
+1. **Conversion Integrity**: Whether the JPG file on Drive is valid, non-corrupt, readable, and non-empty.
+2. **Tag Accuracy**: Independently downloads and runs local multi-pass OCR on the actual converted JPG.
+3. **Filename vs Image Tag Match**: Performs strict, exact comparison between the catalog tag embedded in the filename and the tag printed inside the image.
+4. **Mismatch Detection**: Detects truncated tags (e.g. `DER55.jpg` holding `DER552`), un-renamed camera files (`IMG_4008.jpg` holding `DER558`), or OCR discrepancies.
+5. **Auditing & Reporting**: Records all findings in the persistent `verification_audit` SQLite table without disrupting production.
+
+### 8.2 Architecture (C + D Hybrid)
+- **Architecture D (Process & Worker Isolation)**: Operates as a completely independent Node.js process with its own memory heap. Verification uses an isolated, single-concurrency OCR worker pool (`verifyOcrPool = new ocr.OcrWorkerPool(1)`), completely separated from the conversion pool.
+- **Architecture C (Idle-Aware Gating)**: Evaluates `isConversionQueueIdle()` before processing each image. If active conversion jobs (`PENDING` or `PROCESSING`) exist, verification immediately yields and pauses, guaranteeing **100% absolute priority to active HEIC conversions**.
+
+### 8.3 Verification State Machine
+Records every audit in SQLite table `verification_audit`:
+- **`UNVERIFIED`**: File discovered on Google Drive, pending audit.
+- **`VERIFYING`**: File currently downloaded and undergoing validation and OCR.
+- **`VERIFIED`**: Filename tag matches the image tag with exact equality (e.g. `DER552.jpg` holding `DER552`).
+- **`MISMATCH`**: Image tag differs from filename tag (e.g. `DER55.jpg` holding `DER552`, or `IMG_4008.jpg` holding `DER558`).
+- **`NO_TAG_DETECTED`**: No readable jewelry catalog code found in image.
+- **`REVIEW_REQUIRED`**: Ambiguous OCR candidates or candidate rejected by tag sanity guard.
+- **`FAILED`**: Technical error (corrupt JPEG, download failure, read error).
+
+### 8.4 Safety Rules & Auto-Repair Policy
+- **No Blind Auto-Renaming**: Initial implementation operates strictly on a **DETECT $\to$ RECORD $\to$ REPORT** model. Automated renaming is held behind `ENABLE_AUTO_REPAIR=false`.
+- **Strict Equality**: Substring matching (`filename.includes(detectedTag)`) is strictly forbidden to avoid false matches between similar catalog numbers (`DBR21` vs `DBR212` vs `DBR213`).
+- **Idempotency**: Already `VERIFIED` files are permanently cached in SQLite and skipped on subsequent runs, performing zero redundant downloads and zero OCR operations.
+- **Artifact Protection**: Ignores test files, debug files, QA files (`QA_*`, `TEST_*`), and non-JPG formats.
+

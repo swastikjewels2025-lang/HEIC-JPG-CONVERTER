@@ -283,6 +283,43 @@ This document serves as the **operational troubleshooting manual** for the HEIC 
 
 ---
 
+### Issue 13: Truncated or Mismatched Filenames on Dark-Background Images
+- **Status**: `FIXED`
+- **Symptom**: Images with dark backgrounds are renamed with truncated numbers (e.g. `DER55.jpg`, `DER46.jpg`) when the physical tag inside the image reads `DER552` or `DER461`.
+- **Root Cause**: Tesseract OCR splits digits on dark/reflective backgrounds (reading `"DER 55 2"`). The regex terminated at the space boundary before the trailing digit, matching only the first 2 digits (`"DER 55"`).
+- **Where to Check**:
+  - File: [`src/ocr.js`](file:///d:/automation/heic-drive-converter/src/ocr.js) $\to$ `extractTagPattern()` (lines 184–212).
+  - File: [`src/queue.js`](file:///d:/automation/heic-drive-converter/src/queue.js) $\to$ `verifyTagSanity()` (lines 26–65).
+  - File: [`src/verifier.js`](file:///d:/automation/heic-drive-converter/src/verifier.js) $\to$ `verifySingleFile()`.
+- **How to Diagnose**:
+  Run `npm run verify:folder --report` to inspect all detected tags vs filenames.
+- **Current Behavior**:
+  1. `splitRegex` captures separated digit groups (e.g. `"DER 55 2"` $\to$ `"DER552"`).
+  2. Candidate scoring prioritizes 3–5 digit catalog numbers over partial 2-digit matches.
+  3. `verifyTagSanity()` enforces prefix length and digit rules before renaming.
+  4. `src/verifier.js` independently audits already converted Drive JPGs.
+- **Correct Fix**:
+  Preserve split-digit reconnection and candidate ranking in `ocr.js`, plus pre-upload tag sanity in `queue.js`.
+
+---
+
+### Issue 14: Folder Verification Starving Active Conversions or Locking Workers
+- **Status**: `FIXED`
+- **Symptom**: Running folder-level verification slows down or blocks new incoming HEIC conversions.
+- **Root Cause**: Verification sharing the main conversion OCR worker pool or running concurrently on limited VPS CPU.
+- **Where to Check**:
+  - File: [`src/verifier.js`](file:///d:/automation/heic-drive-converter/src/verifier.js) $\to$ `verifyOcrPool` (line 18) and `isConversionQueueIdle()` (lines 35–45).
+  - File: [`src/ocr.js`](file:///d:/automation/heic-drive-converter/src/ocr.js) $\to$ `OcrWorkerPool` injection in `detectTagFromImage()`.
+- **How to Diagnose**:
+  Check logs for `[Verifier] Conversion queue active — yielding to conversion workers`.
+- **Current Behavior**:
+  1. Verification uses its own dedicated, isolated single-worker OCR pool (`verifyOcrPool = new ocr.OcrWorkerPool(1)`), completely separate from production conversion workers.
+  2. Before processing each file, `isConversionQueueIdle()` queries SQLite. If `PENDING > 0` or `PROCESSING > 0`, verification pauses and yields 100% of VPS resources to conversion workers.
+- **Correct Fix**:
+  Never share the OCR pool between conversion and verification; enforce idle gating.
+
+---
+
 ## 3. Summary of Issue Resolutions
 
 | # | Known Issue / Scenario | Root Cause | Resolution in Current Codebase | Status |
@@ -299,3 +336,6 @@ This document serves as the **operational troubleshooting manual** for the HEIC 
 | 10 | Temp files filling VPS disk | Orphaned temp files on failure | `finally` unlink + startup sweep of files > 1 hour | **FIXED** |
 | 11 | Google Drive API rate limits | Repetitive list calls per file | In-memory `Set` caching for 0ms filename lookups | **FIXED** |
 | 12 | Uppercase `.HEIC` skipped | Strict case comparison & MIME filter | `.toLowerCase()` extension parsing + permissive MIME check | **FIXED** |
+| 13 | Truncated tags on dark images (`DER55`) | Tesseract digit splitting on dark cushions | Split-digit reconnection + candidate scoring + tag sanity guard | **FIXED** |
+| 14 | Verifier starving conversion workers | Shared OCR worker pool & concurrency | Dedicated `verifyOcrPool(1)` + Architecture C idle gating | **FIXED** |
+

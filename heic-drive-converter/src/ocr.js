@@ -309,13 +309,15 @@ function extractTagPattern(rawText) {
  * @param {string} imagePath Absolute path to the local JPG image
  * @returns {Promise<string|null>} Detected tag number or null if none found
  */
-async function detectTagFromImage(imagePath) {
+async function detectTagFromImage(imagePath, customPool = null) {
   let ocrWorker = null;
   let imageBuffer = null;
   let sharedGrayBuf = null;
 
+  const targetPool = customPool || pool;
+
   try {
-    ocrWorker = await pool.acquireWorker();
+    ocrWorker = await targetPool.acquireWorker();
     if (!ocrWorker) return null;
 
     // Read image into memory buffer once to prevent any race condition with temporary file deletion
@@ -483,7 +485,7 @@ async function detectTagFromImage(imagePath) {
     sharedGrayBuf = null;
     imageBuffer = null;
     if (ocrWorker) {
-      pool.releaseWorker(ocrWorker);
+      targetPool.releaseWorker(ocrWorker);
     }
   }
 }
@@ -509,5 +511,6 @@ module.exports = {
   extractTagPattern,
   terminateWorker,
   prewarmWorker,
-  JEWELRY_CATALOG_PREFIXES
+  JEWELRY_CATALOG_PREFIXES,
+  OcrWorkerPool
 };

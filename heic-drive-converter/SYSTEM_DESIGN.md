@@ -88,6 +88,7 @@ graph TD
 | [`src/queue.js`](file:///d:/automation/heic-drive-converter/src/queue.js) | Job queue lifecycle, atomic worker loops, retry backoff, and cleanup | `addToQueue()`, `claimNextPendingJob()`, `updateJobStatus()`, `handleJobFailure()`, `processJob()`, `workerLoop()`, `processQueue()`, `shutdown()`, `cleanupOrphanedTempFiles()`, `getActiveCount()` | `src/db.js`, `src/drive.js`, `src/converter.js`, `src/validator.js`, `src/ocr.js`, `src/config.js`, `src/logger.js` | `src/index.js`, `src/scanner.js` |
 | [`src/index.js`](file:///d:/automation/heic-drive-converter/src/index.js) | Production 24/7 daemon entry point, periodic Drive polling, graceful shutdown | `startDaemon()`, `checkFolder()`, `gracefulShutdown()` | `src/db.js`, `src/config.js`, `src/logger.js`, `src/drive.js`, `src/queue.js`, `src/ocr.js` | PM2 / `npm start` |
 | [`src/scanner.js`](file:///d:/automation/heic-drive-converter/src/scanner.js) | Standalone CLI bulk backlog scanner and runner | `runScan()` | `src/db.js`, `src/drive.js`, `src/queue.js`, `src/config.js`, `src/logger.js` | `npm run scan` |
+| [`src/verifier.js`](file:///d:/automation/heic-drive-converter/src/verifier.js) | Independent folder-level converted image verification service (Architecture C+D) | `runVerification()`, `verifySingleFile()`, `isConversionQueueIdle()`, `extractExpectedTagFromFilename()`, `isVerifiableJpg()`, `verifyOcrPool` | `src/db.js`, `src/drive.js`, `src/ocr.js`, `src/validator.js`, `src/queue.js`, `src/config.js`, `src/logger.js` | `npm run verify:folder` |
 | [`src/status.js`](file:///d:/automation/heic-drive-converter/src/status.js) | Operational CLI metrics report and terminal dashboard | `showStatus()` | `src/db.js`, `src/logger.js` | `npm run status` |
 | [`test_ocr.js`](file:///d:/automation/heic-drive-converter/test_ocr.js) | OCR benchmark test suite and single-image testing CLI | `runBenchmarkSuite()`, `testSingleImage()` | `src/ocr.js`, `sharp` | `npm run test:speed` |
 | [`ecosystem.config.js`](file:///d:/automation/heic-drive-converter/ecosystem.config.js) | PM2 process manager configuration | PM2 app descriptor (`fork` mode, `800M` limit, log routes) | PM2 runtime | PM2 CLI |
@@ -377,6 +378,16 @@ If Python `pillow-heif` is unavailable in the environment, `src/converter.js` au
 6. `heif-convert-cli` (System binary).
 7. `imagemagick` (`magick` / `convert`).
 *Once an engine succeeds, it is cached in `cachedWorkingEngine` to skip retry overhead on subsequent files.*
+
+### 3.10 Folder-Level Converted Image Verification Service (`src/verifier.js`)
+The verification service runs independently (Architecture C + D Hybrid) to audit existing converted JPGs on Google Drive:
+- **Process Isolation**: Operates as a separate Node.js process via `npm run verify:folder`, completely decoupling memory and event loops from the main conversion daemon.
+- **Dedicated OCR Worker**: Instantiates an isolated single-worker OCR pool (`const verifyOcrPool = new ocr.OcrWorkerPool(1)`), eliminating any possibility of acquiring or blocking workers from the production conversion pool.
+- **Idle Gating**: Evaluates `isConversionQueueIdle()` via SQLite before processing each file. If `conversion_queue` has any `PENDING` or `PROCESSING` jobs, verification pauses and yields immediately.
+- **Tag Extraction from Filename**: `extractExpectedTagFromFilename(filename)` parses catalog codes from filenames (e.g. `DER552.jpg` $\to$ `DER552`, `DER55.jpg` $\to$ `DER55`, `IMG_4008.jpg` $\to$ `null`).
+- **Strict Equality Matching**: Compares expected tag against detected image tag with 100% exact equality. Substring matching is strictly prohibited to prevent similar tag collisions (`DBR21` vs `DBR212` vs `DBR213`).
+- **State Machine & Audit Storage**: Records all audits in SQLite table `verification_audit` (`UNVERIFIED`, `VERIFYING`, `VERIFIED`, `MISMATCH`, `NO_TAG_DETECTED`, `REVIEW_REQUIRED`, `FAILED`).
+- **Controlled Auto-Repair Guard**: `ENABLE_AUTO_REPAIR` defaults to `false`. Mismatches are recorded and reported for operator review; automated renames are disabled initially.
 
 ---
 

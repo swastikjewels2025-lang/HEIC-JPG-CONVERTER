@@ -355,3 +355,35 @@ flowchart TD
     TerminateOCR --> CloseDB[db.db.close: Release SQLite Database Locks]
     CloseDB --> ExitProcess[process.exit(0): Daemon Exits Cleanly]
 ```
+
+---
+
+### 3.7 Folder-Level Converted Image Verification Flow (Architecture C+D)
+
+```mermaid
+flowchart TD
+    Start["Run npm run verify:folder (Separate Process)"] --> InitDB[Initialize SQLite DB & verification_audit]
+    InitDB --> InitPool["Create Dedicated OCR Pool (Concurrency = 1)"]
+    InitPool --> ListDrive[Query Google Drive folder for JPGs]
+    ListDrive --> FilterJPG[Filter non-JPGs & QA files]
+    FilterJPG --> CheckAuditTable{Already VERIFIED in SQLite?}
+    CheckAuditTable -->|Yes| Skip[Skip redundant download & OCR]
+    CheckAuditTable -->|No| CheckQueueIdle{Conversion Queue Idle?<br/>PENDING == 0 & PROCESSING == 0}
+    CheckQueueIdle -->|No| YieldSleep[Yield to Conversions: Sleep 5s] --> CheckQueueIdle
+    CheckQueueIdle -->|Yes| DownloadJPG[Download JPG to temp/verifier/]
+    DownloadJPG --> ValidateJPG[Validate JPEG Headers & Dimensions]
+    ValidateJPG -->|Corrupt/Invalid| MarkFailed["Record status = 'FAILED'"]
+    ValidateJPG -->|Valid| RunOCR["Run Local OCR via verifyOcrPool (Isolated)"]
+    RunOCR --> ExtractNameTag[Extract Expected Tag from Filename]
+    ExtractNameTag --> CompareTags{Exact Equality Check:<br/>expectedTag === detectedTag?}
+    CompareTags -->|Exact Match| MarkVerified["Record status = 'VERIFIED'"]
+    CompareTags -->|Differs & Valid Tag| MarkMismatch["Record status = 'MISMATCH'<br/>(Auto-repair held for review)"]
+    CompareTags -->|Generic Camera Name| MarkGenericMismatch["Record status = 'MISMATCH'<br/>(Un-renamed camera file)"]
+    CompareTags -->|No Tag Found| MarkNoTag["Record status = 'NO_TAG_DETECTED'"]
+    MarkFailed & MarkVerified & MarkMismatch & MarkGenericMismatch & MarkNoTag --> CleanTemp[Delete local temp JPG]
+    CleanTemp --> Throttle[Sleep 500ms Throttle]
+    Throttle --> NextFile{More files in batch?}
+    NextFile -->|Yes| CheckQueueIdle
+    NextFile -->|No| TerminateVerify[Terminate verifyOcrPool & Print Report]
+```
+

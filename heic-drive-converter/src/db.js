@@ -72,11 +72,31 @@ async function init() {
   `;
   await run(sql);
 
-  // Auto-recover any orphaned jobs that were left in PROCESSING state during a crash/restart
+  // Auto-recover any orphaned conversion jobs left in PROCESSING state
   const recoverResult = await run("UPDATE conversion_queue SET status = 'PENDING' WHERE status = 'PROCESSING'");
   if (recoverResult && recoverResult.changes > 0) {
-    logger.info(`Auto-recovered ${recoverResult.changes} orphaned PROCESSING jobs back to PENDING.`);
+    logger.info(`Auto-recovered ${recoverResult.changes} orphaned PROCESSING conversion jobs back to PENDING.`);
   }
+
+  const auditSql = `
+    CREATE TABLE IF NOT EXISTS verification_audit (
+      file_id TEXT PRIMARY KEY,
+      filename TEXT NOT NULL,
+      expected_tag TEXT,
+      detected_tag TEXT,
+      status TEXT NOT NULL,
+      mismatch_reason TEXT,
+      is_valid_jpg INTEGER DEFAULT 1,
+      ocr_time_ms REAL,
+      verified_at INTEGER,
+      updated_at INTEGER
+    )
+  `;
+  await run(auditSql);
+  await run('CREATE INDEX IF NOT EXISTS idx_verification_status ON verification_audit(status)');
+
+  // Auto-recover any orphaned verification jobs that were left in VERIFYING state
+  await run("UPDATE verification_audit SET status = 'UNVERIFIED' WHERE status = 'VERIFYING'");
 
   logger.info('Database schema and WAL PRAGMAs verified/initialized successfully.');
 }
