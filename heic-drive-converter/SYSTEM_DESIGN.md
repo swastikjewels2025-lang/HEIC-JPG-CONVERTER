@@ -386,8 +386,10 @@ The verification service runs independently (Architecture C + D Hybrid) to audit
 - **Idle Gating**: Evaluates `isConversionQueueIdle()` via SQLite before processing each file. If `conversion_queue` has any `PENDING` or `PROCESSING` jobs, verification pauses and yields immediately.
 - **Tag Extraction from Filename**: `extractExpectedTagFromFilename(filename)` parses catalog codes from filenames (e.g. `DER552.jpg` $\to$ `DER552`, `DER55.jpg` $\to$ `DER55`, `IMG_4008.jpg` $\to$ `null`).
 - **Strict Equality Matching**: Compares expected tag against detected image tag with 100% exact equality. Substring matching is strictly prohibited to prevent similar tag collisions (`DBR21` vs `DBR212` vs `DBR213`).
-- **State Machine & Audit Storage**: Records all audits in SQLite table `verification_audit` (`UNVERIFIED`, `VERIFYING`, `VERIFIED`, `MISMATCH`, `NO_TAG_DETECTED`, `REVIEW_REQUIRED`, `FAILED`).
-- **Controlled Auto-Repair Guard**: `ENABLE_AUTO_REPAIR` defaults to `false`. Mismatches are recorded and reported for operator review; automated renames are disabled initially.
+- **Automatic Mismatch Repair**: When a validated OCR tag differs from the current filename stem, the verifier automatically renames the Drive file to `<detectedTag>.jpg` via `drive.renameFile(fileId, targetFilename)`.
+- **Collision Protection**: Before renaming, `drive.getFileByNameInFolder(targetFilename)` verifies whether the target filename already exists on Drive. If another file has that name, rename is prevented, and status is recorded as `REPAIR_CONFLICT`.
+- **Failure Resilience**: If Google Drive API calls fail (network disconnect, expired credentials), the error is caught, recorded as `REPAIR_FAILED`, and execution safely continues for remaining files.
+- **State Machine & Audit Storage**: Records all audits in SQLite table `verification_audit` (`UNVERIFIED`, `VERIFYING`, `VERIFIED`, `REPAIRED`, `REPAIR_CONFLICT`, `REPAIR_FAILED`, `MISMATCH`, `NO_TAG_DETECTED`, `REVIEW_REQUIRED`, `FAILED`).
 
 ---
 

@@ -9,8 +9,9 @@ const validator = require('./validator');
 const queue = require('./queue');
 const { performance } = require('perf_hooks');
 
-// Verification configuration
-const ENABLE_AUTO_REPAIR = process.env.ENABLE_AUTO_REPAIR === 'true';
+// Verification & Auto-Repair configuration
+// Enabled by default; can be disabled via ENABLE_AUTO_REPAIR=false or CLI --no-repair / --dry-run
+const ENABLE_AUTO_REPAIR = process.env.ENABLE_AUTO_REPAIR !== 'false';
 const VERIFY_THROTTLE_MS = parseInt(process.env.VERIFY_THROTTLE_MS, 10) || 500;
 const VERIFY_TEMP_DIR = path.join(config.tempDir, 'verifier');
 
@@ -76,7 +77,7 @@ function isVerifiableJpg(filename, mimeType) {
 }
 
 /**
- * Extracts the expected jewelry catalog tag from a filename.
+ * Extracts the expected jewelry catalog tag from a filename stem.
  * e.g., 'DER552.jpg' -> 'DER552'
  *       'DER55.jpg' -> 'DER55'
  *       'DBR336_1.jpg' -> 'DBR336'
@@ -110,22 +111,24 @@ function extractExpectedTagFromFilename(filename) {
 }
 
 /**
- * Verifies an individual converted JPG file downloaded from Google Drive.
+ * Verifies an individual converted JPG file downloaded from Google Drive and auto-repairs mismatches.
  *
  * @param {Object} file Google Drive file object { id, name, size, mimeType }
+ * @param {Object} options Configuration options { autoRepair }
  * @returns {Promise<Object>} Verification audit result
  */
-async function verifySingleFile(file) {
+async function verifySingleFile(file, options = {}) {
   const localPath = path.join(VERIFY_TEMP_DIR, `${file.id}.jpg`);
   const expectedTag = extractExpectedTagFromFilename(file.name);
+  const autoRepair = options.autoRepair !== undefined ? options.autoRepair : ENABLE_AUTO_REPAIR;
   const now = Date.now();
 
   try {
     // 1. Mark status as VERIFYING in audit table
     await db.run(`
       INSERT OR REPLACE INTO verification_audit 
-      (file_id, filename, expected_tag, detected_tag, status, mismatch_reason, is_valid_jpg, ocr_time_ms, verified_at, updated_at)
-      VALUES (?, ?, ?, NULL, 'VERIFYING', NULL, 1, 0, ?, ?)
+      (file_id, filename, expected_tag, detected_tag, status, mismatch_reason, is_valid_jpg, ocr_time_ms, repaired_filename, conflicting_file_id, verified_at, updated_at)
+      VALUES (?, ?, ?, NULL, 'VERIFYING', NULL, 1, 0, NULL, NULL, ?, ?)
     `, [file.id, file.name, expectedTag, now, now]);
 
     // 2. Download file from Google Drive
@@ -153,6 +156,8 @@ async function verifySingleFile(file) {
 
     let status = 'REVIEW_REQUIRED';
     let reason = null;
+    let repairedFilename = null;
+    let conflictingFileId = null;
 
     // 5. Exact Tag vs Filename Comparison (Strict: Substring matching strictly prohibited)
     if (expectedTag && detectedTag) {
@@ -164,9 +169,46 @@ async function verifySingleFile(file) {
         // Tag differs: check detected tag sanity
         const sanity = queue.verifyTagSanity(detectedTag);
         if (sanity.valid) {
-          status = 'MISMATCH';
-          reason = `Image tag '${detectedTag}' does not match filename tag '${expectedTag}'`;
-          logger.warn(`[Verifier] Detected Tag: ${detectedTag} | Filename Tag: ${expectedTag} -> MISMATCH`);
+          const targetFilename = `${detectedTag}.jpg`;
+          logger.info(`[Verifier] MISMATCH: File: ${file.name} | Detected Tag: ${detectedTag} | Expected Filename: ${targetFilename}`);
+
+          if (autoRepair) {
+            // Safety Check: Collision / Duplicate Protection on Google Drive
+            try {
+              const existingFile = await drive.getFileByNameInFolder(targetFilename);
+              if (existingFile && existingFile.id !== file.id) {
+                // Conflict detected: Target filename already exists on Google Drive
+                status = 'REPAIR_CONFLICT';
+                conflictingFileId = existingFile.id;
+                reason = `Target filename '${targetFilename}' already exists on Google Drive (ID: ${existingFile.id}). Auto-repair skipped to prevent collision.`;
+                logger.warn(`[Verifier] REPAIR_CONFLICT: Target already exists: ${targetFilename} (ID: ${existingFile.id}) for file ${file.name}`);
+              } else {
+                // No conflict: Safe to auto-rename
+                logger.info(`[Verifier] AUTO-REPAIR: Renaming: ${file.name} -> ${targetFilename}`);
+                await drive.renameFile(file.id, targetFilename);
+                drive.updateFilenameInCache(file.name, targetFilename);
+
+                // Post-rename verification: verify file exists on Drive
+                const exists = await drive.checkFileExists(file.id);
+                if (!exists) {
+                  throw new Error(`File ID ${file.id} not verified on Drive after rename`);
+                }
+
+                status = 'REPAIRED';
+                repairedFilename = targetFilename;
+                reason = `Auto-repaired: Renamed from '${file.name}' to '${targetFilename}'`;
+                logger.info(`[Verifier] REPAIRED: ${file.name} -> ${targetFilename}`);
+              }
+            } catch (repairErr) {
+              status = 'REPAIR_FAILED';
+              reason = `Drive rename failed: ${repairErr.message}`;
+              logger.error(`[Verifier] REPAIR_FAILED: File: ${file.name} | Reason: ${repairErr.message}`);
+            }
+          } else {
+            status = 'MISMATCH';
+            reason = `Image tag '${detectedTag}' does not match filename tag '${expectedTag}' (Auto-repair disabled)`;
+            logger.warn(`[Verifier] ${file.name} -> MISMATCH (Auto-repair disabled)`);
+          }
         } else {
           status = 'REVIEW_REQUIRED';
           reason = `Ambiguous tag detected ('${detectedTag}') differs from '${expectedTag}', but failed sanity: ${sanity.reason}`;
@@ -174,15 +216,48 @@ async function verifySingleFile(file) {
         }
       }
     } else if (!expectedTag && detectedTag) {
-      // Un-renamed generic camera filename (e.g. IMG_4008.jpg) contains a readable tag
+      // Un-renamed generic camera filename (e.g. IMG_9422.jpg, IMG_4008.jpg) contains a readable tag
       const sanity = queue.verifyTagSanity(detectedTag);
       if (sanity.valid) {
-        status = 'MISMATCH';
-        reason = `Un-renamed camera filename contains detected catalog tag '${detectedTag}'`;
-        logger.warn(`[Verifier] Generic filename '${file.name}' contains detected tag '${detectedTag}' -> MISMATCH`);
+        const targetFilename = `${detectedTag}.jpg`;
+        logger.info(`[Verifier] MISMATCH: File: ${file.name} | Detected Tag: ${detectedTag} | Expected Filename: ${targetFilename}`);
+
+        if (autoRepair) {
+          try {
+            const existingFile = await drive.getFileByNameInFolder(targetFilename);
+            if (existingFile && existingFile.id !== file.id) {
+              status = 'REPAIR_CONFLICT';
+              conflictingFileId = existingFile.id;
+              reason = `Target filename '${targetFilename}' already exists on Google Drive (ID: ${existingFile.id}). Auto-repair skipped to prevent collision.`;
+              logger.warn(`[Verifier] REPAIR_CONFLICT: Target already exists: ${targetFilename} (ID: ${existingFile.id}) for file ${file.name}`);
+            } else {
+              logger.info(`[Verifier] AUTO-REPAIR: Renaming: ${file.name} -> ${targetFilename}`);
+              await drive.renameFile(file.id, targetFilename);
+              drive.updateFilenameInCache(file.name, targetFilename);
+
+              const exists = await drive.checkFileExists(file.id);
+              if (!exists) {
+                throw new Error(`File ID ${file.id} not verified on Drive after rename`);
+              }
+
+              status = 'REPAIRED';
+              repairedFilename = targetFilename;
+              reason = `Auto-repaired: Renamed un-renamed file '${file.name}' to '${targetFilename}'`;
+              logger.info(`[Verifier] REPAIRED: ${file.name} -> ${targetFilename}`);
+            }
+          } catch (repairErr) {
+            status = 'REPAIR_FAILED';
+            reason = `Drive rename failed: ${repairErr.message}`;
+            logger.error(`[Verifier] REPAIR_FAILED: File: ${file.name} | Reason: ${repairErr.message}`);
+          }
+        } else {
+          status = 'MISMATCH';
+          reason = `Un-renamed camera filename contains detected catalog tag '${detectedTag}' (Auto-repair disabled)`;
+          logger.warn(`[Verifier] Generic filename '${file.name}' contains detected tag '${detectedTag}' -> MISMATCH`);
+        }
       } else {
         status = 'REVIEW_REQUIRED';
-        reason = `Un-renamed file produced ambiguous tag '${detectedTag}'`;
+        reason = `Un-renamed file produced ambiguous tag '${detectedTag}': ${sanity.reason}`;
       }
     } else if (expectedTag && !detectedTag) {
       // Filename had expected tag, but OCR detected no tag in image
@@ -200,20 +275,17 @@ async function verifySingleFile(file) {
     const verifiedAt = Date.now();
     await db.run(`
       UPDATE verification_audit 
-      SET detected_tag = ?, status = ?, mismatch_reason = ?, is_valid_jpg = 1, ocr_time_ms = ?, verified_at = ?, updated_at = ?
+      SET detected_tag = ?, status = ?, mismatch_reason = ?, is_valid_jpg = 1, ocr_time_ms = ?, repaired_filename = ?, conflicting_file_id = ?, verified_at = ?, updated_at = ?
       WHERE file_id = ?
-    `, [detectedTag, status, reason, ocrTimeMs, verifiedAt, verifiedAt, file.id]);
-
-    // 7. Controlled Auto-Repair Guard (Disabled by default)
-    if (status === 'MISMATCH' && ENABLE_AUTO_REPAIR) {
-      logger.warn(`[Verifier] Auto-repair flag is ENABLED, but automated renaming is intentionally held for operator review.`);
-    }
+    `, [detectedTag, status, reason, ocrTimeMs, repairedFilename, conflictingFileId, verifiedAt, verifiedAt, file.id]);
 
     return {
       status,
       filename: file.name,
       expectedTag,
       detectedTag,
+      repairedFilename,
+      conflictingFileId,
       ocrTimeMs,
       reason
     };
@@ -240,12 +312,12 @@ async function verifySingleFile(file) {
  * Runs a complete verification scan across converted JPGs in the Google Drive folder.
  * Implements Architecture C (Idle Gating) + Architecture D (Process & Worker Isolation).
  *
- * @param {Object} options Configuration options { limit, reverifyAll }
+ * @param {Object} options Configuration options { limit, reverifyAll, autoRepair }
  */
 async function runVerification(options = {}) {
-  const { limit = 0, reverifyAll = false } = options;
+  const { limit = 0, reverifyAll = false, autoRepair = ENABLE_AUTO_REPAIR } = options;
 
-  logger.info('=== Starting Folder-Level Converted Image Verification ===');
+  logger.info(`=== Starting Folder-Level Converted Image Verification (Auto-Repair: ${autoRepair ? 'ENABLED' : 'DISABLED'}) ===`);
   await db.init();
 
   // 1. Fetch all files from Google Drive target folder
@@ -273,11 +345,11 @@ async function runVerification(options = {}) {
   const filesToVerify = [];
   for (const file of jpgCandidates) {
     const audit = auditMap.get(file.id);
-    if (!reverifyAll && audit && audit.status === 'VERIFIED') {
-      logger.info(`[Verifier] Skipping already VERIFIED file: ${file.name}`);
+    if (!reverifyAll && audit && (audit.status === 'VERIFIED' || audit.status === 'REPAIRED')) {
+      logger.info(`[Verifier] Skipping already VERIFIED/REPAIRED file: ${file.name}`);
       continue;
     }
-    if (!reverifyAll && audit && (audit.status === 'MISMATCH' || audit.status === 'NO_TAG_DETECTED')) {
+    if (!reverifyAll && audit && (audit.status === 'NO_TAG_DETECTED' || audit.status === 'REPAIR_CONFLICT')) {
       logger.info(`[Verifier] Skipping previously audited file: ${file.name} [${audit.status}]`);
       continue;
     }
@@ -290,6 +362,9 @@ async function runVerification(options = {}) {
   const results = {
     total: targetFiles.length,
     verified: 0,
+    repaired: 0,
+    repairConflict: 0,
+    repairFailed: 0,
     mismatch: 0,
     noTag: 0,
     reviewRequired: 0,
@@ -318,9 +393,12 @@ async function runVerification(options = {}) {
     if (isShuttingDown) break;
 
     logger.info(`[Verifier] [${i + 1}/${targetFiles.length}] Processing ${file.name}...`);
-    const res = await verifySingleFile(file);
+    const res = await verifySingleFile(file, { autoRepair });
 
     if (res.status === 'VERIFIED') results.verified++;
+    else if (res.status === 'REPAIRED') results.repaired++;
+    else if (res.status === 'REPAIR_CONFLICT') results.repairConflict++;
+    else if (res.status === 'REPAIR_FAILED') results.repairFailed++;
     else if (res.status === 'MISMATCH') results.mismatch++;
     else if (res.status === 'NO_TAG_DETECTED') results.noTag++;
     else if (res.status === 'REVIEW_REQUIRED') results.reviewRequired++;
@@ -340,7 +418,10 @@ async function runVerification(options = {}) {
   console.log(`Audited in this run:        ${results.total}`);
   console.log(`Skipped (Already Verified): ${results.skipped}`);
   console.log(`VERIFIED (Exact Match):     \x1b[32m${results.verified}\x1b[0m`);
-  console.log(`MISMATCH:                   \x1b[31m${results.mismatch}\x1b[0m`);
+  console.log(`REPAIRED (Auto-Renamed):    \x1b[32m${results.repaired}\x1b[0m`);
+  console.log(`REPAIR_CONFLICT:            \x1b[33m${results.repairConflict}\x1b[0m`);
+  console.log(`REPAIR_FAILED:              \x1b[31m${results.repairFailed}\x1b[0m`);
+  console.log(`MISMATCH (Unrepaired):      \x1b[31m${results.mismatch}\x1b[0m`);
   console.log(`NO_TAG_DETECTED:            \x1b[33m${results.noTag}\x1b[0m`);
   console.log(`REVIEW_REQUIRED:            \x1b[35m${results.reviewRequired}\x1b[0m`);
   console.log(`FAILED (Corrupt/Read Err):  \x1b[31m${results.failed}\x1b[0m`);
@@ -363,28 +444,32 @@ async function printAuditReport() {
   }
 
   console.log(
-    'Filename'.padEnd(20) + ' | ' +
+    'Filename'.padEnd(18) + ' | ' +
     'Expected'.padEnd(10) + ' | ' +
     'Detected'.padEnd(10) + ' | ' +
     'Status'.padEnd(16) + ' | ' +
+    'Repaired Name'.padEnd(16) + ' | ' +
     'OCR Time'.padEnd(10) + ' | ' +
     'Reason'
   );
-  console.log('-'.repeat(95));
+  console.log('-'.repeat(115));
 
   for (const r of rows) {
-    const color = r.status === 'VERIFIED' ? '\x1b[32m' : (r.status === 'MISMATCH' ? '\x1b[31m' : '\x1b[33m');
+    const isSuccess = r.status === 'VERIFIED' || r.status === 'REPAIRED';
+    const isWarn = r.status === 'REPAIR_CONFLICT' || r.status === 'NO_TAG_DETECTED' || r.status === 'REVIEW_REQUIRED';
+    const color = isSuccess ? '\x1b[32m' : (isWarn ? '\x1b[33m' : '\x1b[31m');
     const reset = '\x1b[0m';
     console.log(
-      r.filename.padEnd(20) + ' | ' +
+      r.filename.padEnd(18) + ' | ' +
       (r.expected_tag || 'N/A').padEnd(10) + ' | ' +
       (r.detected_tag || 'NONE').padEnd(10) + ' | ' +
       `${color}${r.status.padEnd(16)}${reset} | ` +
+      (r.repaired_filename || '-').padEnd(16) + ' | ' +
       `${(r.ocr_time_ms || 0).toFixed(0)} ms`.padEnd(10) + ' | ' +
       (r.mismatch_reason || 'OK')
     );
   }
-  console.log('-'.repeat(95) + '\n');
+  console.log('-'.repeat(115) + '\n');
 }
 
 /**
@@ -406,6 +491,8 @@ async function main() {
   }
 
   const reverifyAll = args.includes('--reverify');
+  const noRepair = args.includes('--no-repair') || args.includes('--dry-run');
+  const autoRepair = noRepair ? false : ENABLE_AUTO_REPAIR;
 
   const shutdownHandler = async () => {
     if (isShuttingDown) return;
@@ -419,7 +506,7 @@ async function main() {
   process.on('SIGTERM', shutdownHandler);
 
   try {
-    await runVerification({ limit, reverifyAll });
+    await runVerification({ limit, reverifyAll, autoRepair });
   } finally {
     await verifyOcrPool.terminateAll();
   }
@@ -438,5 +525,6 @@ module.exports = {
   isConversionQueueIdle,
   extractExpectedTagFromFilename,
   isVerifiableJpg,
-  verifyOcrPool
+  verifyOcrPool,
+  ENABLE_AUTO_REPAIR
 };

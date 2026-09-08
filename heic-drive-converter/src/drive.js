@@ -240,6 +240,55 @@ async function getUniqueFilenameInFolder(baseName, ext = '.jpg') {
   return target;
 }
 
+/**
+ * Retrieves a file by exact name in the monitored folder.
+ * Returns the file metadata object { id, name } or null if not found.
+ */
+async function getFileByNameInFolder(filename) {
+  try {
+    const res = await drive.files.list({
+      q: `'${config.driveFolderId}' in parents and name = '${filename}' and trashed = false`,
+      fields: 'files(id, name)',
+      pageSize: 1,
+      supportsAllDrives: true,
+      includeItemsFromAllDrives: true,
+      corpora: 'allDrives'
+    });
+    if (res.data.files && res.data.files.length > 0) {
+      return res.data.files[0];
+    }
+    return null;
+  } catch (err) {
+    logger.warn(`Failed to query file by name '${filename}': ${err.message}`);
+    throw err;
+  }
+}
+
+/**
+ * Renames an existing file on Google Drive in place.
+ * 
+ * @param {string} fileId Google Drive file ID
+ * @param {string} newFilename New filename to assign
+ * @returns {Promise<Object>} Updated file metadata { id, name }
+ */
+async function renameFile(fileId, newFilename) {
+  const res = await drive.files.update({
+    fileId: fileId,
+    requestBody: { name: newFilename },
+    fields: 'id, name',
+    supportsAllDrives: true
+  });
+  return res.data;
+}
+
+/**
+ * Updates the in-memory filename cache when a file is renamed.
+ */
+function updateFilenameInCache(oldFilename, newFilename) {
+  if (oldFilename) folderFilenameCache.delete(oldFilename.toLowerCase());
+  if (newFilename) folderFilenameCache.add(newFilename.toLowerCase());
+}
+
 module.exports = {
   listFolderFiles,
   downloadFile,
@@ -248,5 +297,9 @@ module.exports = {
   checkFileExists,
   checkFilenameExistsInFolder,
   getUniqueFilenameInFolder,
+  getFileByNameInFolder,
+  renameFile,
+  updateFilenameInCache,
   driveClient: drive
 };
+

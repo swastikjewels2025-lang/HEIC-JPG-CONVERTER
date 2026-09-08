@@ -88,12 +88,22 @@ async function init() {
       mismatch_reason TEXT,
       is_valid_jpg INTEGER DEFAULT 1,
       ocr_time_ms REAL,
+      repaired_filename TEXT,
+      conflicting_file_id TEXT,
       verified_at INTEGER,
       updated_at INTEGER
     )
   `;
   await run(auditSql);
   await run('CREATE INDEX IF NOT EXISTS idx_verification_status ON verification_audit(status)');
+
+  // Safely migrate existing databases if columns are missing
+  try {
+    await run('ALTER TABLE verification_audit ADD COLUMN repaired_filename TEXT');
+  } catch (e) {}
+  try {
+    await run('ALTER TABLE verification_audit ADD COLUMN conflicting_file_id TEXT');
+  } catch (e) {}
 
   // Auto-recover any orphaned verification jobs that were left in VERIFYING state
   await run("UPDATE verification_audit SET status = 'UNVERIFIED' WHERE status = 'VERIFYING'");

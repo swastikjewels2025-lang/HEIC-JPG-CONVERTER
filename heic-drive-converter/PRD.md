@@ -318,14 +318,21 @@ Records every audit in SQLite table `verification_audit`:
 - **`UNVERIFIED`**: File discovered on Google Drive, pending audit.
 - **`VERIFYING`**: File currently downloaded and undergoing validation and OCR.
 - **`VERIFIED`**: Filename tag matches the image tag with exact equality (e.g. `DER552.jpg` holding `DER552`).
-- **`MISMATCH`**: Image tag differs from filename tag (e.g. `DER55.jpg` holding `DER552`, or `IMG_4008.jpg` holding `DER558`).
+- **`REPAIRED`**: Mismatch detected; file automatically renamed on Google Drive to `<detectedTag>.jpg` after passing tag sanity and collision checks.
+- **`REPAIR_CONFLICT`**: Auto-repair halted because target filename `<detectedTag>.jpg` already exists in the folder on Google Drive. Overwriting is strictly prevented.
+- **`REPAIR_FAILED`**: Google Drive rename operation failed (network error, auth error, permission error); logged with reason while verifier continues gracefully.
+- **`MISMATCH`**: Image tag differs from filename tag when auto-repair is disabled via `ENABLE_AUTO_REPAIR=false` or `--no-repair`.
 - **`NO_TAG_DETECTED`**: No readable jewelry catalog code found in image.
-- **`REVIEW_REQUIRED`**: Ambiguous OCR candidates or candidate rejected by tag sanity guard.
+- **`REVIEW_REQUIRED`**: Ambiguous OCR candidates or candidate rejected by tag sanity guard (e.g. `DER1`).
 - **`FAILED`**: Technical error (corrupt JPEG, download failure, read error).
 
 ### 8.4 Safety Rules & Auto-Repair Policy
-- **No Blind Auto-Renaming**: Initial implementation operates strictly on a **DETECT $\to$ RECORD $\to$ REPORT** model. Automated renaming is held behind `ENABLE_AUTO_REPAIR=false`.
+- **Automated Repair (`ENABLE_AUTO_REPAIR`)**: When a valid jewelry catalog tag is detected inside the image that does not match the filename stem, the verifier safely renames the Google Drive file to `<detectedTag>.jpg` in place.
+- **Pre-Repair Validation**: Auto-repair requires that `verifyTagSanity(detectedTag)` passes, confirming a recognized jewelry prefix and valid digit count. Truncated or invalid reads (e.g. single-digit `DER1`) are flagged as `REVIEW_REQUIRED` and never renamed.
+- **Collision Protection**: Before renaming, the verifier queries Google Drive via `getFileByNameInFolder(targetFilename)`. If the target filename already exists, the file is NOT overwritten; it is flagged as `REPAIR_CONFLICT` with the conflicting file ID recorded.
+- **In-Place Metadata Rename**: Renaming is performed using `drive.files.update({ name: targetFilename })`. The file is never re-downloaded, re-uploaded, or recreated, and image contents/MIME types remain 100% unaltered.
 - **Strict Equality**: Substring matching (`filename.includes(detectedTag)`) is strictly forbidden to avoid false matches between similar catalog numbers (`DBR21` vs `DBR212` vs `DBR213`).
-- **Idempotency**: Already `VERIFIED` files are permanently cached in SQLite and skipped on subsequent runs, performing zero redundant downloads and zero OCR operations.
+- **Idempotency**: Once renamed and verified, subsequent verification runs observe exact match between filename and image tag, returning `VERIFIED` with zero renames or duplicate suffix mutations.
 - **Artifact Protection**: Ignores test files, debug files, QA files (`QA_*`, `TEST_*`), and non-JPG formats.
+
 

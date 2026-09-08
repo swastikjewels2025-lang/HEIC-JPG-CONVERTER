@@ -308,7 +308,7 @@ This document serves as the **operational troubleshooting manual** for the HEIC 
 - **Symptom**: Running folder-level verification slows down or blocks new incoming HEIC conversions.
 - **Root Cause**: Verification sharing the main conversion OCR worker pool or running concurrently on limited VPS CPU.
 - **Where to Check**:
-  - File: [`src/verifier.js`](file:///d:/automation/heic-drive-converter/src/verifier.js) $\to$ `verifyOcrPool` (line 18) and `isConversionQueueIdle()` (lines 35–45).
+  - File: [`src/verifier.js`](file:///d:/automation/heic-drive-converter/src/verifier.js) $\to$ `verifyOcrPool` (line 19) and `isConversionQueueIdle()` (lines 35–45).
   - File: [`src/ocr.js`](file:///d:/automation/heic-drive-converter/src/ocr.js) $\to$ `OcrWorkerPool` injection in `detectTagFromImage()`.
 - **How to Diagnose**:
   Check logs for `[Verifier] Conversion queue active — yielding to conversion workers`.
@@ -317,6 +317,25 @@ This document serves as the **operational troubleshooting manual** for the HEIC 
   2. Before processing each file, `isConversionQueueIdle()` queries SQLite. If `PENDING > 0` or `PROCESSING > 0`, verification pauses and yields 100% of VPS resources to conversion workers.
 - **Correct Fix**:
   Never share the OCR pool between conversion and verification; enforce idle gating.
+
+---
+
+### Issue 15: Filename Mismatch Auto-Repair & Target Collision Handling
+- **Status**: `FIXED`
+- **Symptom**: A converted JPG has an outdated or truncated filename (e.g. `DER55.jpg` or `IMG_9422.jpg`) while the image contains `DER552` or `DBR334`.
+- **Root Cause**: Past conversions created prior to Option 2 fixes or camera filenames that bypassed OCR renaming.
+- **Where to Check**:
+  - File: [`src/verifier.js`](file:///d:/automation/heic-drive-converter/src/verifier.js) $\to$ `verifySingleFile()`.
+  - File: [`src/drive.js`](file:///d:/automation/heic-drive-converter/src/drive.js) $\to$ `getFileByNameInFolder()` and `renameFile()`.
+- **How to Diagnose**:
+  Run `npm run verify:folder --report` to inspect all `REPAIRED` and `REPAIR_CONFLICT` records.
+- **Current Behavior**:
+  1. If detected tag passes `verifyTagSanity()` and differs from current filename, verifier automatically renames the Drive file to `<detectedTag>.jpg` in place.
+  2. Before renaming, `getFileByNameInFolder()` checks if `<detectedTag>.jpg` already exists. If a collision is found, renaming is prevented and status is set to `REPAIR_CONFLICT`.
+  3. If Drive API fails, status transitions to `REPAIR_FAILED` without crashing the daemon.
+  4. Subsequent scans find exact match and record `VERIFIED` with zero duplicate renames.
+- **Correct Fix**:
+  Maintain in-place Drive metadata renaming, sanity checks, and collision detection in `src/verifier.js`.
 
 ---
 
@@ -338,4 +357,6 @@ This document serves as the **operational troubleshooting manual** for the HEIC 
 | 12 | Uppercase `.HEIC` skipped | Strict case comparison & MIME filter | `.toLowerCase()` extension parsing + permissive MIME check | **FIXED** |
 | 13 | Truncated tags on dark images (`DER55`) | Tesseract digit splitting on dark cushions | Split-digit reconnection + candidate scoring + tag sanity guard | **FIXED** |
 | 14 | Verifier starving conversion workers | Shared OCR worker pool & concurrency | Dedicated `verifyOcrPool(1)` + Architecture C idle gating | **FIXED** |
+| 15 | Filename mismatch & collision safety | Camera names / pre-Option 2 truncations | In-place Drive rename + collision check (`REPAIR_CONFLICT`) | **FIXED** |
+
 

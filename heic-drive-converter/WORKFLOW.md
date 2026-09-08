@@ -358,7 +358,7 @@ flowchart TD
 
 ---
 
-### 3.7 Folder-Level Converted Image Verification Flow (Architecture C+D)
+### 3.7 Folder-Level Converted Image Verification & Auto-Repair Flow
 
 ```mermaid
 flowchart TD
@@ -366,7 +366,7 @@ flowchart TD
     InitDB --> InitPool["Create Dedicated OCR Pool (Concurrency = 1)"]
     InitPool --> ListDrive[Query Google Drive folder for JPGs]
     ListDrive --> FilterJPG[Filter non-JPGs & QA files]
-    FilterJPG --> CheckAuditTable{Already VERIFIED in SQLite?}
+    FilterJPG --> CheckAuditTable{Already VERIFIED or REPAIRED?}
     CheckAuditTable -->|Yes| Skip[Skip redundant download & OCR]
     CheckAuditTable -->|No| CheckQueueIdle{Conversion Queue Idle?<br/>PENDING == 0 & PROCESSING == 0}
     CheckQueueIdle -->|No| YieldSleep[Yield to Conversions: Sleep 5s] --> CheckQueueIdle
@@ -377,10 +377,15 @@ flowchart TD
     RunOCR --> ExtractNameTag[Extract Expected Tag from Filename]
     ExtractNameTag --> CompareTags{Exact Equality Check:<br/>expectedTag === detectedTag?}
     CompareTags -->|Exact Match| MarkVerified["Record status = 'VERIFIED'"]
-    CompareTags -->|Differs & Valid Tag| MarkMismatch["Record status = 'MISMATCH'<br/>(Auto-repair held for review)"]
-    CompareTags -->|Generic Camera Name| MarkGenericMismatch["Record status = 'MISMATCH'<br/>(Un-renamed camera file)"]
+    CompareTags -->|Differs or Generic Name| ValidateSanity{verifyTagSanity passed?}
+    ValidateSanity -->|No| MarkReview["Record status = 'REVIEW_REQUIRED'"]
+    ValidateSanity -->|Yes| CheckCollision{Target &lt;tag&gt;.jpg exists on Drive?}
+    CheckCollision -->|Yes| MarkConflict["Record status = 'REPAIR_CONFLICT'<br/>(Prevent Overwrite)"]
+    CheckCollision -->|No| DriveRename["drive.renameFile(fileId, targetFilename)"]
+    DriveRename -->|Success| VerifyDrive["drive.checkFileExists(fileId)"] --> MarkRepaired["Record status = 'REPAIRED'"]
+    DriveRename -->|Failure| MarkRepairFailed["Record status = 'REPAIR_FAILED'"]
     CompareTags -->|No Tag Found| MarkNoTag["Record status = 'NO_TAG_DETECTED'"]
-    MarkFailed & MarkVerified & MarkMismatch & MarkGenericMismatch & MarkNoTag --> CleanTemp[Delete local temp JPG]
+    MarkFailed & MarkVerified & MarkRepaired & MarkConflict & MarkRepairFailed & MarkReview & MarkNoTag --> CleanTemp[Delete local temp JPG]
     CleanTemp --> Throttle[Sleep 500ms Throttle]
     Throttle --> NextFile{More files in batch?}
     NextFile -->|Yes| CheckQueueIdle
